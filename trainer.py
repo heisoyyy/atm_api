@@ -117,7 +117,7 @@ def train(df: pd.DataFrame, status_callback=None) -> dict:
     model.fit(X, y, eval_set=[(X, y)], verbose=False)
 
     # Feature importance
-    fi = sorted(
+    fi = sorted( 
         zip(FITUR, model.feature_importances_),
         key=lambda x: x[1], reverse=True
     )

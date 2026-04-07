@@ -3,11 +3,11 @@ predictor.py
 Bangun prediction list dari snapshot terbaru tiap ATM — V6.
 
 Perubahan V6 vs V5:
-  - pred_status menggunakan threshold V6 (AMAN >25% | AWAS 20–25% | BONGKAR <20%)
+  - pred_status menggunakan threshold V6 (AMAN >30% | AWAS 20–30% | BONGKAR <20%)
   - Tambah field: tgl_awas, jam_awas (kapan masuk AWAS)
   - Tambah field: cashout_harian, cashout_mingguan, cashout_bulanan
   - Tambah field: pred_saldo_6j, pred_saldo_12j, pred_saldo_24j, pred_saldo_48j, pred_saldo_72j
-  - Tambah field: rekomendasi_isi (jumlah dan target 80% limit)
+  - Tambah field: rekomendasi_isi (jumlah dan target 100% limit)
   - Jadwal isi dihitung dari saat saldo menyentuh batas AWAS (25%) minus 2 jam buffer
 """
 
@@ -132,8 +132,8 @@ def build_predictions(df: pd.DataFrame) -> list:
             habis_dt = now_dt + timedelta(hours=est_jam)
             est_hari = est_jam / 24
 
-            # Kapan saldo menyentuh batas AWAS (25% limit)
-            saldo_awas_thr = limit * STATUS_AMAN_PCT  # 25%
+            # Kapan saldo menyentuh batas AWAS (30% limit)
+            saldo_awas_thr = limit * STATUS_AMAN_PCT  # 30%
             if avg_eff > 0 and saldo > saldo_awas_thr:
                 jam_ke_awas = (saldo - saldo_awas_thr) / avg_eff
                 awas_dt     = now_dt + timedelta(hours=jam_ke_awas)
@@ -153,11 +153,11 @@ def build_predictions(df: pd.DataFrame) -> list:
         status_pred = pred_status(est_jam, pct)
 
         if status_pred in ['BONGKAR', 'AWAS']:
-            target_saldo    = limit * 0.80
+            target_saldo    = limit * 1
             jumlah_isi      = max(0.0, target_saldo - saldo)
-            rekomendasi_isi = f'Segera isi Rp {jumlah_isi:,.0f} (target 80% limit)'
+            rekomendasi_isi = f'Segera isi Rp {jumlah_isi:,.0f} (target 100% limit)'
         elif status_pred == 'PERLU PANTAU':
-            target_saldo    = limit * 0.80
+            target_saldo    = limit * 1
             jumlah_isi      = max(0.0, target_saldo - saldo)
             rekomendasi_isi = (
                 f'Jadwalkan isi Rp {jumlah_isi:,.0f} sebelum {tgl_isi} {jam_isi}'

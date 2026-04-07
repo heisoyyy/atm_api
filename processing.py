@@ -3,7 +3,7 @@ processing.py
 Semua logic dari Smart ATM V6 Notebook Cell 4 — agar konsisten dengan Colab.
 
 Perubahan V6 vs V5:
-  - Status threshold: AMAN >25% | AWAS 20–25% | BONGKAR <20%  (sebelumnya 40/25/20)
+  - Status threshold: AMAN >30% | AWAS 20–30% | BONGKAR <20%  (sebelumnya 25/20)
   - status_v6() menggantikan status_saldo()
   - Tambah kolom 'Alamat ATM' di ffill list interpolasi
   - Vendor cleaning menggunakan format "X - SSI WILAYAH YYYY" (uppercase)
@@ -75,13 +75,13 @@ def pred_status(est_jam, pct):
     Status prediksi V6:
       OVERFUND   : pct > 100
       BONGKAR    : pct <= 20  ATAU est_jam < 6 jam
-      AWAS       : pct <= 25  ATAU est_jam < 24 jam
+      AWAS       : pct <= 30  ATAU est_jam < 24 jam
       PERLU PANTAU: est_jam < 72 jam
       AMAN       : est_jam >= 72 jam atau tidak ada histori
     """
     if pct > 100:   return 'OVERFUND'
     if pct <= 20:   return 'BONGKAR'
-    if pct <= 25:   return 'AWAS'
+    if pct <= 30:   return 'AWAS'
     if est_jam is None: return 'AMAN'
     elif est_jam < 6:   return 'BONGKAR'
     elif est_jam < 24:  return 'AWAS'
@@ -92,10 +92,10 @@ def pred_status(est_jam, pct):
 def status_saldo(pct):
     """
     Status saldo V6 berdasarkan persentase saldo terhadap limit.
-    AMAN >25% | AWAS 20–25% | BONGKAR <20%
+    AMAN >30% | AWAS 20–30% | BONGKAR <20%
     """
     if pct > 100:   return 'OVERFUND'
-    elif pct > 25:  return 'AMAN'
+    elif pct > 30:  return 'AMAN'
     elif pct > 20:  return 'AWAS'
     else:           return 'BONGKAR'
 
@@ -169,7 +169,7 @@ def process_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     Input  : df mentah (kolom: ID ATM, Sisa Saldo, Limit, Tanggal, Jam, ...)
     Output : df lengkap dengan semua fitur siap pakai
 
-    Status threshold V6: AMAN >25% | AWAS 20–25% | BONGKAR <20%
+    Status threshold V6: AMAN >30% | AWAS 20–30% | BONGKAR <20%
     """
 
     # ── 0. Normalisasi ID ATM ────────────────────────────

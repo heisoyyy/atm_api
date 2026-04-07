@@ -12,8 +12,8 @@ PRED_CACHE    = DATA_DIR / "predictions_cache.json"
 DATA_DIR.mkdir(exist_ok=True)
 
 # ── Thresholds Status V6 (Tambahkan Bagian Ini) ──
-# Sesuai deskripsi main.py: AMAN >25% | AWAS 20-25% | BONGKAR <20%
-STATUS_AMAN_PCT    = 0.25
+# AMAN >30% | AWAS 20-30% | BONGKAR <20%
+STATUS_AMAN_PCT    = 0.30
 STATUS_AWAS_PCT    = 0.20
 STATUS_BONGKAR_PCT = 0.20
 
@@ -25,8 +25,8 @@ INTERPOLASI_MAX_GAP = 3
 CAP_JAM             = 168
 
 # Tambahkan ini di config.py
-STATUS_AMAN_PCT = 0.25    # > 25%
-STATUS_AWAS_PCT = 0.20    # 20% - 25%
+STATUS_AMAN_PCT = 0.30    # > 30%
+STATUS_AWAS_PCT = 0.20    # 20% - 30%
 # BONGKAR otomatis di bawah 20%
 
 WILAYAH_LIST = ["Pekanbaru", "Batam", "Dumai", "Tanjung Pinang"]

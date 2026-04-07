@@ -1,7 +1,7 @@
 """
 main.py — Smart ATM Dashboard API v6
 =====================================
-Status V6: AMAN >25% | AWAS 20-25% | BONGKAR <20%
+Status V6: AMAN >30% | AWAS 20-30% | BONGKAR <20%
 
 Endpoints:
   GET  /                        health check
@@ -55,7 +55,7 @@ def _sanitize(obj):
 
 app = FastAPI(
     title="Smart ATM Dashboard API",
-    description="Backend monitoring & prediksi saldo ATM BRK Syariah — V6 (AMAN >25% | AWAS 20-25% | BONGKAR <20%)",
+    description="Backend monitoring & prediksi saldo ATM BRK Syariah — V6 (AMAN >30% | AWAS 20-30% | BONGKAR <20%)",
     version="6.0.0",
 )
 
@@ -95,8 +95,8 @@ def root():
         "status":  "running",
         "time":    datetime.now().isoformat(),
         "thresholds": {
-            "aman":    "> 25%",
-            "awas":    "20–25%",
+            "aman":    "> 30%",
+            "awas":    "20–30%",
             "bongkar": "< 20%",
         },
     }
