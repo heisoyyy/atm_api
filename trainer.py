@@ -1,13 +1,16 @@
 """
 trainer.py
-Training XGBoost dari processed DataFrame.
+Training XGBoost dari processed DataFrame — V6.
 Dijalankan sebagai background task saat ada data baru.
+
+Perubahan V6 vs V5:
+  - Model disimpan sebagai xgboost_atm_v6.pkl / xgboost_fitur_v6.pkl
+  - Tidak ada perubahan arsitektur model (hiperparameter identik)
 """
 
 import numpy as np
 import pandas as pd
 import joblib
-from pathlib import Path
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import mean_absolute_error, r2_score
 from xgboost import XGBRegressor
@@ -42,11 +45,10 @@ def train(df: pd.DataFrame, status_callback=None) -> dict:
 
     df_train = df[FITUR + ['Est Jam Habis Rule']].copy()
 
-    # Explicit fillna
     for col in [c for c in FITUR if any(k in c for k in ['Lag', 'Avg', 'Std'])]:
         df_train[col] = df_train[col].fillna(0)
 
-    # FIX #6: Fallback target pakai Avg24j jika cascade None
+    # Fallback target pakai Avg24j jika cascade None
     mask_none = df_train['Est Jam Habis Rule'].isna()
     if mask_none.any():
         avg24_est = (
@@ -64,6 +66,19 @@ def train(df: pd.DataFrame, status_callback=None) -> dict:
     n_splits = min(5, max(2, n_hari // 5))
 
     _cb(15, f"Data training: {len(X):,} baris | {n_hari} hari | {n_splits}-fold CV")
+
+    if len(X) < 100:
+        _cb(100, "⚠️ Data terlalu sedikit — model tidak dilatih, gunakan Rule-Based cascade")
+        return {
+            "mae_avg":      None,
+            "r2_avg":       None,
+            "n_train":      int(len(X)),
+            "n_hari":       int(n_hari),
+            "n_folds":      0,
+            "top_features": [],
+            "model_path":   None,
+            "note":         "Data < 100 baris, model tidak dilatih",
+        }
 
     model = XGBRegressor(
         n_estimators=400,
@@ -108,18 +123,18 @@ def train(df: pd.DataFrame, status_callback=None) -> dict:
     )
     top10 = [{"fitur": f, "importance": round(float(v), 4)} for f, v in fi[:10]]
 
-    # Save model
+    # Simpan model V6
     joblib.dump(model, MODEL_PATH)
     joblib.dump(FITUR,  FITUR_PATH)
 
-    _cb(100, "Model disimpan ✅")
+    _cb(100, "Model V6 disimpan ✅")
 
     return {
-        "mae_avg":     round(float(np.mean(mae_list)), 2),
-        "r2_avg":      round(float(np.mean(r2_list)), 4),
-        "n_train":     int(len(X)),
-        "n_hari":      int(n_hari),
-        "n_folds":     n_splits,
+        "mae_avg":      round(float(np.mean(mae_list)), 2),
+        "r2_avg":       round(float(np.mean(r2_list)), 4),
+        "n_train":      int(len(X)),
+        "n_hari":       int(n_hari),
+        "n_folds":      n_splits,
         "top_features": top10,
-        "model_path":  str(MODEL_PATH),
+        "model_path":   str(MODEL_PATH),
     }

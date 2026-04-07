@@ -1,0 +1,17 @@
+"""
+main.py — Smart ATM Dashboard API v5
+=====================================
+Endpoints:
+  GET  /                        health check
+  GET  /api/status              status model + data
+  POST /api/upload              upload CSV/Excel, proses, simpan
+  POST /api/train               trigger retrain XGBoost (background)
+  GET  /api/train/status        progress retrain
+  GET  /api/predictions         seluruh prediksi (+ filter)
+  GET  /api/predictions/{id}    detail 1 ATM
+  GET  /api/summary             ringkasan per wilayah
+  GET  /api/alerts              ATM dengan status KRITIS / SEGERA ISI
+  GET  /api/history/{id}        data historis saldo 1 ATM
+  GET  /api/wilayah             list wilayah + statistik
+  DELETE /api/data              hapus semua data & model (reset)
+"""

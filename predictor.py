@@ -1,6 +1,14 @@
 """
 predictor.py
-Bangun prediction list dari snapshot terbaru tiap ATM.
+Bangun prediction list dari snapshot terbaru tiap ATM — V6.
+
+Perubahan V6 vs V5:
+  - pred_status menggunakan threshold V6 (AMAN >25% | AWAS 20–25% | BONGKAR <20%)
+  - Tambah field: tgl_awas, jam_awas (kapan masuk AWAS)
+  - Tambah field: cashout_harian, cashout_mingguan, cashout_bulanan
+  - Tambah field: pred_saldo_6j, pred_saldo_12j, pred_saldo_24j, pred_saldo_48j, pred_saldo_72j
+  - Tambah field: rekomendasi_isi (jumlah dan target 80% limit)
+  - Jadwal isi dihitung dari saat saldo menyentuh batas AWAS (25%) minus 2 jam buffer
 """
 
 import json
@@ -10,7 +18,7 @@ import joblib
 from datetime import datetime, timedelta
 from typing import Optional
 
-from config import MODEL_PATH, FITUR_PATH, PRED_CACHE, CAP_JAM
+from config import MODEL_PATH, FITUR_PATH, PRED_CACHE, CAP_JAM, STATUS_AMAN_PCT
 from processing import est_jam_cascade, pred_status
 
 
@@ -23,24 +31,72 @@ def load_model():
 
 def build_predictions(df: pd.DataFrame) -> list:
     """
-    Ambil snapshot terbaru tiap ATM, jalankan prediksi, return list dict.
+    Ambil snapshot terbaru tiap ATM, jalankan prediksi V6, return list dict.
     """
     model_xgb, fitur_aktif = load_model()
 
-    result      = []
+    result = []
+
+    # Normalize ID ATM
+    df = df.copy()
+    df['ID ATM'] = df['ID ATM'].astype(str).str.strip().str.upper()
+    df = df[~df['ID ATM'].isin(['', 'NAN', 'NONE', 'NULL', 'ID ATM'])]
+
+    df['Sisa Saldo'] = pd.to_numeric(df['Sisa Saldo'], errors='coerce')
+    df['Limit']      = pd.to_numeric(df['Limit'],      errors='coerce')
+    df = df.dropna(subset=['Sisa Saldo', 'Limit'])
+    df = df[df['Limit'] > 0]
+
+    df['datetime'] = pd.to_datetime(df['datetime'], errors='coerce')
+    df = df.dropna(subset=['datetime'])
+
+    # Snapshot terbaru per ATM
     latest_snap = df.loc[df.groupby('ID ATM')['datetime'].idxmax()].copy()
 
     for _, row in latest_snap.iterrows():
-        atm     = row['ID ATM']
-        saldo   = float(row['Sisa Saldo'])
-        limit   = float(row['Limit'])
-        pct     = float(row['Persentase'])
+        atm   = row['ID ATM']
+        saldo = float(row['Sisa Saldo'])
+        limit = float(row['Limit'])
+
+        try:
+            pct = float(row['Persentase'])
+            if pct != pct:  # NaN check
+                pct = round(saldo / limit * 100, 1) if limit > 0 else 0.0
+        except:
+            pct = round(saldo / limit * 100, 1) if limit > 0 else 0.0
+
         avg6j   = max(float(row.get('Avg Penarikan 6j',  0) or 0), 0)
         avg24j  = max(float(row.get('Avg Penarikan 24j', 0) or 0), 0)
         avg72j  = max(float(row.get('Avg Penarikan 72j', 0) or 0), 0)
         is_sepi = int(row.get('Is_ATM_Sepi', 0) or 0)
 
-        # ── Prediksi ──────────────────────────────────────
+        # ── Cash Out analytics dari data historis ATM ini ──────
+        data_atm  = df[df['ID ATM'] == atm]
+        data_asli = (
+            data_atm[data_atm['Is_Interpolated'] == 0]
+            if 'Is_Interpolated' in data_atm.columns
+            else data_atm
+        )
+
+        cashout_per_hari = (
+            data_asli.groupby('Tanggal')['Penarikan'].sum()
+            if 'Tanggal' in data_asli.columns else pd.Series(dtype=float)
+        )
+        cashout_per_minggu = (
+            data_asli.groupby('Hari Minggu')['Penarikan'].mean()
+            if 'Hari Minggu' in data_asli.columns else pd.Series(dtype=float)
+        )
+
+        cashout_bulanan = 0.0
+        if 'Tanggal' in data_asli.columns and len(data_asli) > 0:
+            tmp = data_asli.copy()
+            tmp['Bulan'] = pd.to_datetime(tmp['Tanggal']).dt.to_period('M')
+            cashout_bulanan = float(tmp.groupby('Bulan')['Penarikan'].sum().mean())
+
+        avg_cashout_harian   = float(cashout_per_hari.mean())   if len(cashout_per_hari)   > 0 else 0.0
+        avg_cashout_mingguan = float(cashout_per_minggu.mean()) * 7 if len(cashout_per_minggu) > 0 else 0.0
+
+        # ── Prediksi jam habis ─────────────────────────────────
         if model_xgb is not None and fitur_aktif:
             try:
                 fitur_ok = [f for f in fitur_aktif if f in row.index]
@@ -53,55 +109,105 @@ def build_predictions(df: pd.DataFrame) -> list:
                     est_rb  = min(saldo / avg72j, float(CAP_JAM))
                     est_jam = 0.3 * est_jam + 0.7 * est_rb
                     metode  = 'XGBoost+Sepi72j'
-            except Exception as e:
+            except Exception:
                 est_jam, metode = _rule_based(saldo, avg6j, avg24j, avg72j)
         else:
             est_jam, metode = _rule_based(saldo, avg6j, avg24j, avg72j)
 
-        # ── Effective rate ────────────────────────────────
-        avg_eff  = avg6j if avg6j > 0 else (avg24j if avg24j > 0 else avg72j)
-        pred_12j = max(0.0, saldo - avg_eff * 12) if avg_eff > 0 else saldo
+        # ── Effective rate ─────────────────────────────────────
+        avg_eff = avg6j if avg6j > 0 else (avg24j if avg24j > 0 else avg72j)
 
-        # ── Waktu habis & jadwal isi ──────────────────────
+        # ── Prediksi saldo per jam ke depan ───────────────────
+        pred_saldo = {}
+        for jam_ke in [6, 12, 24, 48, 72]:
+            saldo_pred = max(0.0, saldo - avg_eff * jam_ke) if avg_eff > 0 else saldo
+            pred_saldo[f'pred_saldo_{jam_ke}j'] = round(saldo_pred, 0)
+
+        # ── Waktu habis, waktu AWAS, jadwal isi ───────────────
         now_dt    = pd.to_datetime(row['datetime'])
-        tgl_habis = jam_habis = tgl_isi = jam_isi = None
+        tgl_habis = jam_habis = tgl_isi = jam_isi = tgl_awas = jam_awas = None
+        est_hari  = None
+
         if est_jam is not None:
-            habis_dt  = now_dt + timedelta(hours=est_jam)
-            isi_dt    = habis_dt - timedelta(hours=6)
+            habis_dt = now_dt + timedelta(hours=est_jam)
+            est_hari = est_jam / 24
+
+            # Kapan saldo menyentuh batas AWAS (25% limit)
+            saldo_awas_thr = limit * STATUS_AMAN_PCT  # 25%
+            if avg_eff > 0 and saldo > saldo_awas_thr:
+                jam_ke_awas = (saldo - saldo_awas_thr) / avg_eff
+                awas_dt     = now_dt + timedelta(hours=jam_ke_awas)
+            else:
+                awas_dt = now_dt  # sudah di bawah AWAS
+
+            # Jadwal isi = 2 jam sebelum masuk AWAS
+            isi_dt    = awas_dt - timedelta(hours=2)
             tgl_habis = habis_dt.strftime('%Y-%m-%d')
             jam_habis = habis_dt.strftime('%H:%M')
+            tgl_awas  = awas_dt.strftime('%Y-%m-%d')
+            jam_awas  = awas_dt.strftime('%H:%M')
             tgl_isi   = isi_dt.strftime('%Y-%m-%d')
             jam_isi   = isi_dt.strftime('%H:%M')
 
-        # ── Status & Skor ─────────────────────────────────
+        # ── Status & Rekomendasi V6 ────────────────────────────
         status_pred = pred_status(est_jam, pct)
-        skor_pct    = (1 - pct / 100) * 40
-        skor_laju   = (avg_eff / max(limit, 1)) * 100 * 30
-        skor_est    = (1 - min(est_jam, CAP_JAM) / CAP_JAM) * 30 if est_jam is not None else 0
-        skor_total  = round(min(skor_pct + skor_laju + skor_est, 100), 1)
 
-        result.append({
-            "id_atm":          atm,
-            "tipe":            str(row.get('Tipe ATM', '-') or '-'),
-            "lokasi":          str(row.get('Lokasi ATM', '-') or '-'),
-            "wilayah":         str(row.get('Wilayah', '-') or '-'),
-            "saldo":           saldo,
-            "limit":           limit,
-            "pct_saldo":       round(pct, 1),
-            "tarik_per_jam":   round(avg_eff, 0),
-            "pred_saldo_12j":  round(pred_12j, 0),
-            "est_jam":         round(est_jam, 1) if est_jam is not None else None,
-            "est_hari":        round(est_jam / 24, 2) if est_jam is not None else None,
-            "tgl_habis":       tgl_habis,
-            "jam_habis":       jam_habis,
-            "tgl_isi":         tgl_isi,
-            "jam_isi":         jam_isi,
-            "status":          status_pred,
-            "skor_urgensi":    float(skor_total),
-            "atm_sepi":        bool(is_sepi),
-            "metode":          metode,
-            "last_update":     str(row['datetime']),
-        })
+        if status_pred in ['BONGKAR', 'AWAS']:
+            target_saldo    = limit * 0.80
+            jumlah_isi      = max(0.0, target_saldo - saldo)
+            rekomendasi_isi = f'Segera isi Rp {jumlah_isi:,.0f} (target 80% limit)'
+        elif status_pred == 'PERLU PANTAU':
+            target_saldo    = limit * 0.80
+            jumlah_isi      = max(0.0, target_saldo - saldo)
+            rekomendasi_isi = (
+                f'Jadwalkan isi Rp {jumlah_isi:,.0f} sebelum {tgl_isi} {jam_isi}'
+                if tgl_isi else f'Jadwalkan isi Rp {jumlah_isi:,.0f}'
+            )
+        else:
+            rekomendasi_isi = 'Tidak perlu isi saat ini'
+
+        # ── Skor Urgensi ───────────────────────────────────────
+        skor_pct   = (1 - pct / 100) * 40
+        skor_laju  = (avg_eff / max(limit, 1)) * 100 * 30
+        skor_est   = (1 - min(est_jam, CAP_JAM) / CAP_JAM) * 30 if est_jam is not None else 0
+        skor_total = round(min(skor_pct + skor_laju + skor_est, 100), 1)
+
+        entry = {
+            "id_atm":              atm,
+            "tipe":                str(row.get('Tipe ATM',  '-') or '-'),
+            "lokasi":              str(row.get('Lokasi ATM','-') or '-'),
+            "wilayah":             str(row.get('Wilayah',   '-') or '-'),
+            "saldo":               saldo,
+            "limit":               limit,
+            "pct_saldo":           round(pct, 1),
+            "tarik_per_jam":       round(avg_eff, 0),
+            # Cash-out analytics (baru di V6)
+            "cashout_harian":      round(avg_cashout_harian,   0),
+            "cashout_mingguan":    round(avg_cashout_mingguan, 0),
+            "cashout_bulanan":     round(cashout_bulanan,      0),
+            # Prediksi saldo ke depan (baru di V6)
+            **pred_saldo,
+            # Estimasi waktu habis
+            "est_jam":             round(est_jam, 1) if est_jam is not None else None,
+            "est_hari":            round(est_hari, 2) if est_hari is not None else None,
+            # Waktu masuk AWAS (baru di V6)
+            "tgl_awas":            tgl_awas,
+            "jam_awas":            jam_awas,
+            # Waktu habis & jadwal isi
+            "tgl_habis":           tgl_habis,
+            "jam_habis":           jam_habis,
+            "tgl_isi":             tgl_isi,
+            "jam_isi":             jam_isi,
+            # Rekomendasi (baru di V6)
+            "rekomendasi_isi":     rekomendasi_isi,
+            "status":              status_pred,
+            "skor_urgensi":        float(skor_total),
+            "atm_sepi":            bool(is_sepi),
+            "metode":              metode,
+            "last_update":         str(row['datetime']),
+        }
+
+        result.append(entry)
 
     result.sort(key=lambda x: x['skor_urgensi'], reverse=True)
     for i, r in enumerate(result):
@@ -130,7 +236,7 @@ def load_cache() -> Optional[dict]:
 # ── Private ───────────────────────────────────────────
 
 def _rule_based(saldo, avg6j, avg24j, avg72j):
-    """Cascade rule-based fallback."""
+    """Cascade rule-based fallback 6j → 24j → 72j."""
     for avg, label in [(avg6j, 'Rule-6j'), (avg24j, 'Rule-24j'), (avg72j, 'Rule-72j')]:
         if avg > 0:
             est = saldo / avg
