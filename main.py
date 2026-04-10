@@ -1,22 +1,14 @@
 """
-main.py — Smart ATM Dashboard API v6
-=====================================
-Status V6: AMAN >30% | AWAS 20-30% | BONGKAR <20%
+main.py — Smart ATM Dashboard API V6.1
+Backend FastAPI + MySQL + XGBoost
 
-Endpoints:
-  GET  /                        health check
-  GET  /api/status              status model + data
-  POST /api/upload              upload CSV/Excel/ZIP, proses, simpan
-  POST /api/train               trigger retrain XGBoost (background)
-  GET  /api/train/status        progress retrain
-  GET  /api/predictions         seluruh prediksi (+ filter)
-  GET  /api/predictions/{id}    detail 1 ATM
-  GET  /api/summary             ringkasan per wilayah
-  GET  /api/alerts              ATM dengan status BONGKAR / AWAS
-  GET  /api/history/{id}        data historis saldo 1 ATM
-  GET  /api/wilayah             list wilayah + statistik
-  GET  /api/debug/atm_ids       debug ID ATM & vendor
-  DELETE /api/data              hapus semua data & model (reset)
+Fixes V6.1 vs V6.0:
+  - Upload: handle nullable dtype dari openpyxl/csv dtype_backend
+  - Upload: gunakan engine='openpyxl' tanpa dtype_backend agar kompatibel
+  - _normalize_columns: lebih robust
+  - Error logging lebih informatif
+  - Tambah endpoint /api/health/db untuk cek koneksi MySQL
+  - Tambah endpoint GET /api/atm-list untuk list semua ATM
 """
 
 import asyncio
@@ -31,17 +23,31 @@ import pandas as pd
 from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
 from config import PROCESSED_CSV, PRED_CACHE, MODEL_PATH, FITUR_PATH, WILAYAH_LIST
 from processing import process_dataframe
 from predictor import build_predictions, save_cache, load_cache
 from trainer import train
+from database import (
+    upsert_predictions,
+    get_predictions_from_db,
+    bulk_insert_history,
+    get_atm_history_from_db,
+    add_to_cashplan,
+    get_cashplan_list,
+    update_cashplan_status,
+    remove_cashplan_only,
+    get_rekap_replacement,
+    log_upload,
+    update_rekap_replacement,
+)
 
 
-# ── App ──────────────────────────────────────────────
+# ── Sanitize helper ───────────────────────────────────────────────────────────
 
 def _sanitize(obj):
-    """Rekursif ganti NaN/Inf dengan None agar JSON-safe."""
+    """Rekursif ganti NaN/Inf → None agar JSON-safe."""
     if isinstance(obj, float):
         if math.isnan(obj) or math.isinf(obj):
             return None
@@ -53,10 +59,12 @@ def _sanitize(obj):
     return obj
 
 
+# ── App ────────────────────────────────────────────────────────────────────────
+
 app = FastAPI(
     title="Smart ATM Dashboard API",
-    description="Backend monitoring & prediksi saldo ATM BRK Syariah — V6 (AMAN >30% | AWAS 20-30% | BONGKAR <20%)",
-    version="6.0.0",
+    description="Backend monitoring & prediksi saldo ATM BRK Syariah — V6.1 + MySQL",
+    version="6.1.0",
 )
 
 app.add_middleware(
@@ -66,16 +74,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-@app.post("/api/clear-cache")
-async def clear_cache():
-    if PRED_CACHE.exists():
-        PRED_CACHE.unlink()
-        return {"message": "Cache berhasil dibersihkan"}
-    return {"message": "Cache sudah kosong"}
 
-# ── Training state (in-memory) ───────────────────────
+# ── Training state (in-memory) ────────────────────────────────────────────────
 _train_state = {
-    "status":       "idle",   # idle | running | done | error
+    "status":       "idle",
     "progress":     0,
     "message":      "",
     "last_trained": None,
@@ -83,32 +85,41 @@ _train_state = {
 }
 
 
-# ════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════════
 #  HEALTH
-# ════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════════
 
 @app.get("/", tags=["Health"])
 def root():
     return {
-        "service": "Smart ATM Dashboard API",
-        "version": "6.0.0",
-        "status":  "running",
-        "time":    datetime.now().isoformat(),
-        "thresholds": {
-            "aman":    "> 30%",
-            "awas":    "20–30%",
-            "bongkar": "< 20%",
-        },
+        "service":    "Smart ATM Dashboard API",
+        "version":    "6.1.0",
+        "status":     "running",
+        "time":       datetime.now().isoformat(),
+        "storage":    "MySQL + JSON Cache",
+        "thresholds": {"aman": "> 30%", "awas": "20–30%", "bongkar": "≤ 20%"},
     }
 
 
-# ════════════════════════════════════════════════════
+@app.get("/api/health/db", tags=["Health"])
+def health_db():
+    """Cek koneksi MySQL."""
+    try:
+        from database import get_conn
+        with get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT 1")
+        return {"status": "ok", "message": "MySQL connected"}
+    except Exception as e:
+        return JSONResponse(status_code=503, content={"status": "error", "message": str(e)})
+
+
+# ════════════════════════════════════════════════════════════════════════════════
 #  STATUS
-# ════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════════
 
 @app.get("/api/status", tags=["Status"])
 def get_status():
-    """Cek apakah data & model sudah ada."""
     has_data  = PROCESSED_CSV.exists()
     has_model = MODEL_PATH.exists() and FITUR_PATH.exists()
     has_cache = PRED_CACHE.exists()
@@ -120,32 +131,88 @@ def get_status():
         "model_path":   str(MODEL_PATH) if has_model else None,
         "train_status": _train_state["status"],
         "last_trained": _train_state["last_trained"],
-        "version":      "6.0.0",
+        "version":      "6.1.0",
+        "config": {
+            "STATUS_AMAN_PCT":    0.30,
+            "STATUS_AWAS_PCT":    0.20,
+            "STATUS_BONGKAR_PCT": 0.20,
+        },
     }
 
     if has_data:
-        df = pd.read_csv(PROCESSED_CSV, usecols=['ID ATM', 'Tanggal'], low_memory=False)
-        df['ID ATM'] = df['ID ATM'].astype(str).str.strip().str.upper()
-        df = df[~df['ID ATM'].isin(['', 'NAN', 'NONE', 'NULL', 'ID ATM'])]
-        info["total_rows"] = len(df)
-        info["total_atm"]  = df['ID ATM'].nunique()
-        info["date_range"] = {
-            "from": str(df['Tanggal'].min()),
-            "to":   str(df['Tanggal'].max()),
-        }
+        try:
+            df = pd.read_csv(PROCESSED_CSV, usecols=['ID ATM', 'Tanggal'], low_memory=False)
+            df['ID ATM'] = df['ID ATM'].astype(str).str.strip().str.upper()
+            df = df[~df['ID ATM'].isin(['', 'NAN', 'NONE', 'NULL', 'ID ATM'])]
+            info["total_rows"] = len(df)
+            info["total_atm"]  = df['ID ATM'].nunique()
+            info["date_range"] = {
+                "from": str(df['Tanggal'].min()),
+                "to":   str(df['Tanggal'].max()),
+            }
+        except Exception as e:
+            info["data_error"] = str(e)
+
+    # Fallback ke MySQL
+    if not has_data or not has_model or not has_cache:
+        try:
+            from database import get_conn
+            with get_conn() as conn:
+                cur = conn.cursor(dictionary=True)
+
+                cur.execute("SELECT COUNT(*) AS cnt FROM predictions")
+                pred_count = cur.fetchone()["cnt"]
+
+                if pred_count > 0:
+                    info["has_data"]  = True
+                    info["has_cache"] = True
+
+                    cur.execute("""
+                        SELECT COUNT(*) AS total_atm, MAX(generated_at) AS generated_at
+                        FROM predictions
+                    """)
+                    pred_row = cur.fetchone()
+                    info["total_atm"]           = int(pred_row["total_atm"] or 0)
+                    info["predictions_count"]   = pred_count
+                    info["predictions_updated"] = (
+                        pred_row["generated_at"].isoformat()
+                        if pred_row.get("generated_at") else None
+                    )
+
+                cur.execute("SELECT COUNT(*) AS cnt FROM atm_history")
+                hist_count = cur.fetchone()["cnt"]
+
+                if hist_count > 0:
+                    info["has_data"]   = True
+                    info["total_rows"] = int(hist_count)
+
+                    cur.execute("""
+                        SELECT MIN(DATE(recorded_at)) AS date_from, MAX(DATE(recorded_at)) AS date_to
+                        FROM atm_history
+                    """)
+                    date_row = cur.fetchone()
+                    info["date_range"] = {
+                        "from": str(date_row["date_from"]) if date_row["date_from"] else "-",
+                        "to":   str(date_row["date_to"])   if date_row["date_to"]   else "-",
+                    }
+        except Exception as e:
+            info["db_error"] = str(e)
 
     if has_cache:
-        cache = load_cache()
-        info["predictions_count"]   = cache.get("count", 0)
-        info["predictions_updated"] = cache.get("generated_at")
-        info["total_atm"]           = cache.get("count", info.get("total_atm", 0))
+        try:
+            cache = load_cache()
+            info["predictions_count"]   = cache.get("count", 0)
+            info["predictions_updated"] = cache.get("generated_at")
+            info["total_atm"]           = cache.get("count", info.get("total_atm", 0))
+        except Exception:
+            pass
 
     return _sanitize(info)
 
 
-# ════════════════════════════════════════════════════
-#  HELPERS — parse ZIP & tabular files
-# ════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════════
+#  HELPERS — file parsing
+# ════════════════════════════════════════════════════════════════════════════════
 
 BULAN_ID = {
     'januari':'01','februari':'02','maret':'03','april':'04',
@@ -155,59 +222,28 @@ BULAN_ID = {
     'jul':'07','agu':'08','agt':'08','sep':'09','okt':'10','nov':'11','des':'12',
 }
 
-BULAN_NAMA = [
-    'Januari','Februari','Maret','April','Mei','Juni',
-    'Juli','Agustus','September','Oktober','November','Desember'
-]
-
 
 def _extract_tanggal(path: str) -> Optional[str]:
-    """
-    Ekstrak tanggal dari path ZIP. Support berbagai format:
-      2026-03-22 / 2026_03_22 → YYYY-MM-DD
-      22-03-2026 / 22/03/2026 → DD-MM-YYYY
-      22 Maret 2026 / 22_Maret_2026 → Indonesia
-    Return: string YYYY-MM-DD atau None.
-    """
-    # YYYY-MM-DD
     m = re.search(r'(\d{4})-(\d{2})-(\d{2})', path)
-    if m:
-        return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
-    # YYYY_MM_DD
+    if m: return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
     m = re.search(r'(\d{4})_(\d{2})_(\d{2})', path)
-    if m:
-        return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
-    # DD-MM-YYYY atau DD/MM/YYYY
+    if m: return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
     m = re.search(r'(\d{1,2})[-/](\d{2})[-/](\d{4})', path)
-    if m:
-        return f"{m.group(3)}-{m.group(2)}-{m.group(1).zfill(2)}"
-    # DD Bulan YYYY — Indonesia (spasi atau underscore)
+    if m: return f"{m.group(3)}-{m.group(2)}-{m.group(1).zfill(2)}"
     m = re.search(r'(\d{1,2})[\s_-]+([A-Za-z]+)[\s_-]+(\d{4})', path)
     if m:
         bln = BULAN_ID.get(m.group(2).lower())
-        if bln:
-            return f"{m.group(3)}-{bln}-{m.group(1).zfill(2)}"
+        if bln: return f"{m.group(3)}-{bln}-{m.group(1).zfill(2)}"
     return None
 
 
 def _extract_jam(basename: str) -> Optional[str]:
-    """
-    Ekstrak jam dari nama file.
-    Mendukung:
-      '21.01.xlsx'                           → '21:00'
-      '09.00.xlsx'                           → '09:00'
-      'Monitoring Saldo ATM BRKS 21.01.xlsx' → '21:00'
-      '09.xlsx' / '9.csv'                    → '09:00'
-    """
     base = re.sub(r'\.(csv|xlsx|xls)$', '', basename, flags=re.IGNORECASE).strip()
-    # Cari semua pasangan HH.MM atau HH:MM di bagian akhir nama
     matches = re.findall(r'(\d{1,2})[\.:](\d{2})', base)
     if matches:
         hh, _ = matches[-1]
-        hh_int = int(hh)
-        if 0 <= hh_int <= 23:
-            return f"{hh_int:02d}:00"
-    # Coba angka tunggal (jam tanpa menit)
+        if 0 <= int(hh) <= 23:
+            return f"{int(hh):02d}:00"
     m = re.search(r'(\d{1,2})$', base)
     if m:
         hh_int = int(m.group(1))
@@ -216,8 +252,8 @@ def _extract_jam(basename: str) -> Optional[str]:
     return None
 
 
-def _read_tabular(zf: "zipfile.ZipFile", name: str) -> pd.DataFrame:
-    """Baca satu file di dalam ZipFile sebagai DataFrame (CSV/XLSX/XLS)."""
+def _read_tabular(zf: zipfile.ZipFile, name: str) -> pd.DataFrame:
+    """Baca file CSV/XLSX dari dalam ZIP. Tidak menggunakan dtype_backend agar aman."""
     lower = name.lower()
     with zf.open(name) as raw:
         data = raw.read()
@@ -227,89 +263,105 @@ def _read_tabular(zf: "zipfile.ZipFile", name: str) -> pd.DataFrame:
         for enc in ("utf-8", "utf-8-sig", "latin-1", "cp1252"):
             try:
                 buf.seek(0)
-                df = pd.read_csv(buf, encoding=enc, dtype_backend="numpy_nullable")
-                break
+                return pd.read_csv(buf, encoding=enc)
             except UnicodeDecodeError:
                 continue
-        else:
-            buf.seek(0)
-            df = pd.read_csv(buf, encoding="latin-1", errors="replace",
-                             dtype_backend="numpy_nullable")
-    elif lower.endswith(".xlsx"):
-        df = pd.read_excel(buf, engine="openpyxl", dtype_backend="numpy_nullable")
-    elif lower.endswith(".xls"):
-        df = pd.read_excel(buf, engine="xlrd")
-    else:
-        raise ValueError(f"Format tidak didukung: {name}")
+        buf.seek(0)
+        return pd.read_csv(buf, encoding="latin-1", errors="replace")
 
-    df = df.convert_dtypes(dtype_backend="numpy_nullable")
-    for col in df.select_dtypes(include=["object", "string"]).columns:
-        df[col] = df[col].astype(str).replace("nan", pd.NA).replace("<NA>", pd.NA)
-    return df
+    elif lower.endswith(".xlsx"):
+        return pd.read_excel(buf, engine="openpyxl")
+
+    elif lower.endswith(".xls"):
+        return pd.read_excel(buf, engine="xlrd")
+
+    raise ValueError(f"Format tidak didukung: {name}")
 
 
 def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Rename kolom dari berbagai format ke nama standar.
-    Sama persis dengan V6 notebook Cell 3.
-    """
-    df.columns = df.columns.str.strip()
+    """Normalize nama kolom agar konsisten."""
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+
     col_rename = {}
     for col in df.columns:
         c = col.lower().strip()
         if 'id' in c and 'atm' in c:
             col_rename[col] = 'ID ATM'
-        elif 'merk' in c:
+        elif c in ('merk atm', 'merk', 'brand'):
             col_rename[col] = 'Merk ATM'
+        elif 'lokasi' in c and 'atm' in c:
+            col_rename[col] = 'Lokasi ATM'
         elif 'lokasi' in c:
             col_rename[col] = 'Lokasi ATM'
         elif 'alamat' in c:
             col_rename[col] = 'Alamat ATM'
         elif 'vendor' in c:
             col_rename[col] = 'Vendor'
-        elif 'limit' in c:
+        elif c == 'limit':
             col_rename[col] = 'Limit'
         elif 'sisa' in c and 'saldo' in c:
             col_rename[col] = 'Sisa Saldo'
-        elif 'denom' in c:
-            col_rename[col] = 'Denom'
-        elif 'lembar' in c:
-            col_rename[col] = 'Lembar'
+        elif c in ('tanggal', 'date', 'tgl'):
+            col_rename[col] = 'Tanggal'
+        elif c in ('jam', 'time', 'waktu'):
+            col_rename[col] = 'Jam'
+
     return df.rename(columns=col_rename)
 
 
-def _parse_zip(zip_bytes: bytes):
+def _read_excel_or_csv(content: bytes, filename: str) -> pd.DataFrame:
     """
-    Parse ZIP V6:
-      - Folder = tanggal (berbagai format Indonesia didukung)
-      - File   = jam snapshot (HH.MM.xlsx / Monitoring ... HH.MM.xlsx)
-    Return (DataFrame gabungan, list warnings)
+    Baca file Excel/CSV dari bytes.
+    TIDAK pakai dtype_backend='numpy_nullable' agar tidak ada nullable dtype issues.
     """
-    SUPPORTED = {".csv", ".xlsx", ".xls"}
-    REQUIRED  = {"ID ATM", "Sisa Saldo", "Limit"}
+    buf = io.BytesIO(content)
+    fname = filename.lower()
 
-    frames = []
-    errors = []
+    if fname.endswith('.csv'):
+        for enc in ('utf-8', 'utf-8-sig', 'latin-1', 'cp1252'):
+            try:
+                buf.seek(0)
+                return pd.read_csv(buf, encoding=enc)
+            except UnicodeDecodeError:
+                continue
+        buf.seek(0)
+        return pd.read_csv(buf, encoding='latin-1', errors='replace')
+
+    elif fname.endswith('.xlsx') or fname.endswith('.xlsm'):
+        buf.seek(0)
+        return pd.read_excel(buf, engine='openpyxl')
+
+    elif fname.endswith('.xls'):
+        buf.seek(0)
+        return pd.read_excel(buf, engine='xlrd')
+
+    raise HTTPException(400, f"Format file tidak didukung: {filename}")
+
+
+def _parse_zip(zip_bytes: bytes):
+    """Parse ZIP berisi file monitoring ATM harian."""
+    SUPPORTED = {".csv", ".xlsx", ".xls"}
+    frames, errors = [], []
 
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
-        names = zf.namelist()
-
-        for name in names:
-            if name.endswith("/") or "/." in name or name.startswith("."):
+        for name in zf.namelist():
+            # Skip direktori dan hidden files
+            if name.endswith("/") or "/." in name or name.startswith(".__"):
                 continue
-            ext = "." + name.rsplit(".", 1)[-1].lower() if "." in name else ""
+            ext = ("." + name.rsplit(".", 1)[-1].lower()) if "." in name else ""
             if ext not in SUPPORTED:
                 continue
 
             tanggal_str = _extract_tanggal(name)
             if not tanggal_str:
-                errors.append(f"Skip (tidak ada tanggal di path): {name}")
+                errors.append(f"Skip (tanggal tidak terdeteksi): {name}")
                 continue
 
             basename = name.split("/")[-1]
             jam_str  = _extract_jam(basename)
             if not jam_str:
-                errors.append(f"Skip (nama file bukan format jam): {name}")
+                errors.append(f"Skip (jam tidak terdeteksi): {name}")
                 continue
 
             try:
@@ -320,9 +372,9 @@ def _parse_zip(zip_bytes: bytes):
 
             df_file = _normalize_columns(df_file)
 
-            missing = REQUIRED - set(df_file.columns)
+            missing = {"ID ATM", "Sisa Saldo", "Limit"} - set(df_file.columns)
             if missing:
-                errors.append(f"Skip {name}: kolom kurang {missing}")
+                errors.append(f"Skip (kolom {missing} tidak ditemukan): {name}")
                 continue
 
             df_file["Tanggal"] = tanggal_str
@@ -330,519 +382,765 @@ def _parse_zip(zip_bytes: bytes):
             frames.append(df_file)
 
     if not frames:
-        detail = "ZIP tidak mengandung file tabular valid (CSV/XLSX/XLS). "
-        if errors:
-            detail += "Detail: " + "; ".join(errors[:5])
-        raise HTTPException(400, detail)
+        detail = "; ".join(errors[:10]) if errors else "Tidak ada file valid di dalam ZIP."
+        raise HTTPException(400, f"ZIP tidak mengandung file valid. {detail}")
 
     df_combined = pd.concat(frames, ignore_index=True)
-    if "Tanggal" in df_combined.columns and "Jam" in df_combined.columns:
-        df_combined = df_combined.drop_duplicates(subset=["ID ATM", "Tanggal", "Jam"])
-    df_combined = df_combined.sort_values(["ID ATM", "Tanggal", "Jam"]).reset_index(drop=True)
-    return df_combined, errors
+    df_combined = df_combined.drop_duplicates(subset=["ID ATM", "Tanggal", "Jam"])
+    return df_combined.sort_values(["ID ATM", "Tanggal", "Jam"]).reset_index(drop=True), errors
 
 
-# ════════════════════════════════════════════════════
-#  UPLOAD DATA
-# ════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════════
+#  UPLOAD — dengan MySQL sync
+# ════════════════════════════════════════════════════════════════════════════════
 
 @app.post("/api/upload", tags=["Data"])
 async def upload_data(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
-    retrain: bool = Query(True, description="Langsung retrain setelah upload?"),
+    retrain: bool = Query(True),
 ):
     """
-    Upload file data ATM (ZIP / CSV / XLSX).
-    ZIP: folder tanggal Indonesia → file Excel per jam (format V6).
-    CSV/XLSX: bisa raw maupun processed (auto-detect).
-
-    Alur:
-      1. Baca & parse file
-      2. Merge incremental dengan data lama
-      3. Process (jika belum processed)
-      4. Rebuild prediction cache
-      5. Retrain XGBoost (opsional, background)
+    Upload data monitoring ATM.
+    Format yang didukung:
+    - ZIP (berisi file XLSX/CSV harian, nama file mengandung tanggal & jam)
+    - XLSX / XLS (file monitoring single snapshot)
+    - CSV (processed atau raw)
     """
     fname   = file.filename or ""
     content = await file.read()
-
     parse_warnings = []
 
-    # ── 1. Baca file ─────────────────────────────────────
+    # ── 1. Parse berdasarkan format ──────────────────────────────────────────
     if fname.lower().endswith(".zip"):
-        try:
-            df_new, parse_warnings = _parse_zip(content)
-        except HTTPException:
-            raise
-        except Exception as e:
-            raise HTTPException(400, f"Gagal membaca ZIP: {e}")
+        df_new, parse_warnings = _parse_zip(content)
         is_processed = False
 
-    elif fname.lower().endswith(".csv"):
-        try:
-            df_new = pd.read_csv(io.BytesIO(content))
-        except Exception as e:
-            raise HTTPException(400, f"Gagal membaca CSV: {e}")
-        missing = {"ID ATM", "Sisa Saldo", "Limit"} - set(df_new.columns)
-        if missing:
-            raise HTTPException(400, f"Kolom wajib tidak ditemukan: {missing}")
+    elif fname.lower().endswith((".xlsx", ".xls", ".xlsm")):
+        df_new = _read_excel_or_csv(content, fname)
         df_new = _normalize_columns(df_new)
-        # Inject Tanggal & Jam dari waktu sekarang jika tidak ada di file
         _now = datetime.now()
         if "Tanggal" not in df_new.columns:
             df_new["Tanggal"] = _now.strftime("%Y-%m-%d")
-            parse_warnings.append(f"Kolom 'Tanggal' tidak ditemukan — diisi otomatis: {_now.strftime('%Y-%m-%d')}")
         if "Jam" not in df_new.columns:
             df_new["Jam"] = _now.strftime("%H:00")
-            parse_warnings.append(f"Kolom 'Jam' tidak ditemukan — diisi otomatis: {_now.strftime('%H:00')}")
         is_processed = "Avg Penarikan 6j" in df_new.columns
 
-    elif fname.lower().endswith((".xlsx", ".xls")):
-        try:
-            df_new = pd.read_excel(io.BytesIO(content), engine="openpyxl")
-        except Exception as e:
-            raise HTTPException(400, f"Gagal membaca Excel: {e}")
-        missing = {"ID ATM", "Sisa Saldo", "Limit"} - set(df_new.columns)
-        if missing:
-            raise HTTPException(400, f"Kolom wajib tidak ditemukan: {missing}")
+    elif fname.lower().endswith(".csv"):
+        df_new = _read_excel_or_csv(content, fname)
         df_new = _normalize_columns(df_new)
-        # Inject Tanggal & Jam dari waktu sekarang jika tidak ada di file
         _now = datetime.now()
         if "Tanggal" not in df_new.columns:
             df_new["Tanggal"] = _now.strftime("%Y-%m-%d")
-            parse_warnings.append(f"Kolom 'Tanggal' tidak ditemukan — diisi otomatis: {_now.strftime('%Y-%m-%d')}")
         if "Jam" not in df_new.columns:
             df_new["Jam"] = _now.strftime("%H:00")
-            parse_warnings.append(f"Kolom 'Jam' tidak ditemukan — diisi otomatis: {_now.strftime('%H:00')}")
         is_processed = "Avg Penarikan 6j" in df_new.columns
 
     else:
-        raise HTTPException(400, "Format file tidak didukung. Gunakan .zip, .csv, atau .xlsx")
+        raise HTTPException(400, f"Format tidak didukung: {fname}. Gunakan ZIP, XLSX, atau CSV.")
 
-    # ── 2. Merge incremental ──────────────────────────────
-    if PROCESSED_CSV.exists():
-        df_old = pd.read_csv(PROCESSED_CSV)
+    # Validasi minimal
+    if df_new.empty:
+        raise HTTPException(400, "File kosong atau tidak ada data yang bisa dibaca.")
 
-        if is_processed:
-            # CSV processed → langsung merge
+    for col in ["ID ATM", "Sisa Saldo", "Limit"]:
+        if col not in df_new.columns:
+            raise HTTPException(
+                400,
+                f"Kolom wajib '{col}' tidak ditemukan. "
+                f"Kolom yang ada: {list(df_new.columns)}"
+            )
+
+    # ── 2. Merge incremental ─────────────────────────────────────────────────
+
+    try:
+        if PROCESSED_CSV.exists():
+            df_old = pd.read_csv(PROCESSED_CSV, low_memory=False)
+            is_old_processed = "Avg Penarikan 6j" in df_old.columns
+
             df_old["ID ATM"] = df_old["ID ATM"].astype(str).str.strip().str.upper()
             df_new["ID ATM"] = df_new["ID ATM"].astype(str).str.strip().str.upper()
-            df_merged = pd.concat([df_old, df_new], ignore_index=True)
-            if "datetime" in df_merged.columns:
-                df_merged["datetime"] = pd.to_datetime(df_merged["datetime"])
-                df_merged = df_merged.drop_duplicates(subset=["ID ATM", "datetime"])
-            elif "Tanggal" in df_merged.columns and "Jam" in df_merged.columns:
-                df_merged["Tanggal"] = df_merged["Tanggal"].astype(str).str[:10]
-                df_merged["Jam"]     = df_merged["Jam"].astype(str).str[:5]
-                df_merged = df_merged.drop_duplicates(subset=["ID ATM", "Tanggal", "Jam"])
-            df_final = df_merged
+
+            if is_processed and is_old_processed:
+                # Keduanya sudah processed — merge langsung, skip re-process
+                df_merged = pd.concat([df_old, df_new], ignore_index=True)
+                if "datetime" in df_merged.columns:
+                    df_merged["datetime"] = pd.to_datetime(df_merged["datetime"])
+                    df_merged = df_merged.drop_duplicates(subset=["ID ATM", "datetime"])
+                df_final = df_merged
+
+            elif not is_processed and is_old_processed:
+                # ZIP baru (raw) masuk, df_old sudah processed
+                # Ambil kolom raw dari df_old, gabung dengan df_new, process ulang semua
+                tanggal_baru = set(df_new["Tanggal"].astype(str).str[:10].unique())
+
+                raw_cols = ["ID ATM", "Sisa Saldo", "Limit", "Tanggal", "Jam",
+                            "Merk ATM", "Lokasi ATM", "Alamat ATM", "Vendor"]
+                raw_cols_available = [c for c in raw_cols if c in df_old.columns]
+
+                df_old_raw = df_old[raw_cols_available].copy()
+                df_old_raw = df_old_raw[
+                    ~df_old_raw["Tanggal"].astype(str).str[:10].isin(tanggal_baru)
+                ]
+
+                df_combined = pd.concat([df_old_raw, df_new], ignore_index=True)
+                df_combined = df_combined.drop_duplicates(subset=["ID ATM", "Tanggal", "Jam"])
+                df_final = process_dataframe(df_combined)
+
+            else:
+                # df_old belum processed — gabung raw dan process semua
+                tanggal_baru = set(df_new["Tanggal"].astype(str).str[:10].unique())
+                df_old = df_old[
+                    ~df_old["Tanggal"].astype(str).str[:10].isin(tanggal_baru)
+                ]
+                df_combined = pd.concat([df_old, df_new], ignore_index=True)
+                df_combined = df_combined.drop_duplicates(subset=["ID ATM", "Tanggal", "Jam"])
+                df_final = process_dataframe(df_combined)
 
         else:
-            # ZIP / raw → ambil kolom raw dari data lama, dedup per tanggal baru
-            RAW_COLS   = ["ID ATM", "Sisa Saldo", "Limit", "Tanggal", "Jam",
-                          "Merk ATM", "Lokasi ATM", "Alamat ATM", "Vendor"]
-            cols_keep  = [c for c in RAW_COLS if c in df_old.columns]
-            df_old_raw = df_old[cols_keep].copy()
+            df_final = df_new if is_processed else process_dataframe(df_new)
 
-            df_old_raw["ID ATM"] = df_old_raw["ID ATM"].astype(str).str.strip().str.upper()
-            df_new["ID ATM"]     = df_new["ID ATM"].astype(str).str.strip().str.upper()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"Gagal memproses data: {str(e)}")
 
-            df_old_raw["Tanggal"] = df_old_raw["Tanggal"].astype(str).str[:10]
-            df_old_raw["Jam"]     = df_old_raw["Jam"].astype(str).str[:5]
-            df_new["Tanggal"]     = df_new["Tanggal"].astype(str).str[:10]
-            df_new["Jam"]         = df_new["Jam"].astype(str).str[:5]
+    # ── 3. Simpan CSV processed ──────────────────────────────────────────────
+    try:
+        df_final.to_csv(PROCESSED_CSV, index=False)
+    except Exception as e:
+        raise HTTPException(500, f"Gagal menyimpan CSV: {str(e)}")
 
-            # Buang data lama yang tanggalnya sama dengan data baru
-            tanggal_baru  = set(df_new["Tanggal"].unique())
-            df_old_raw    = df_old_raw[~df_old_raw["Tanggal"].isin(tanggal_baru)]
-
-            df_combined   = pd.concat([df_old_raw, df_new], ignore_index=True)
-            df_combined   = df_combined.drop_duplicates(subset=["ID ATM", "Tanggal", "Jam"])
-            df_combined   = df_combined.sort_values(["ID ATM", "Tanggal", "Jam"]).reset_index(drop=True)
-            df_final      = process_dataframe(df_combined)
-    else:
-        # Data pertama kali
-        df_final = df_new if is_processed else process_dataframe(df_new)
-
-    # ── 3. Simpan processed data ──────────────────────────
-    df_final.to_csv(PROCESSED_CSV, index=False)
-
-    # ── 4. Rebuild prediction cache ───────────────────────
+    # ── 4. Build predictions ─────────────────────────────────────────────────
     def _clean_pred(p):
-        return {k: (None if isinstance(v, float) and (math.isnan(v) or math.isinf(v)) else v)
-                for k, v in p.items()}
+        return {
+            k: (None if isinstance(v, float) and (math.isnan(v) or math.isinf(v)) else v)
+            for k, v in p.items()
+        }
 
-    predictions = [_clean_pred(p) for p in build_predictions(df_final)]
-    save_cache(predictions)
+    try:
+        predictions = [_clean_pred(p) for p in build_predictions(df_final)]
+        save_cache(predictions)
+    except Exception as e:
+        parse_warnings.append(f"[Prediction Warning] {str(e)}")
+        predictions = []
+
+    # ── 5. Sync ke MySQL ─────────────────────────────────────────────────────
+    db_synced = False
+    try:
+        if predictions:
+            upsert_predictions(predictions)
+        bulk_insert_history(df_final)
+        db_synced = True
+    except Exception as e:
+        parse_warnings.append(f"[DB Warning] {str(e)}")
+
+    # ── 6. Log upload ────────────────────────────────────────────────────────
+    try:
+        log_upload(
+            fname,
+            "ZIP" if fname.lower().endswith(".zip") else "CSV/Excel",
+            len(df_final),
+            df_final["ID ATM"].nunique() if "ID ATM" in df_final.columns else 0,
+            len(predictions),
+            retrain,
+        )
+    except Exception as e:
+        parse_warnings.append(f"[Log Warning] {str(e)}")
 
     resp = {
-        "message":      "Upload berhasil",
-        "version":      "V6",
-        "format":       "ZIP" if fname.lower().endswith(".zip") else "CSV/Excel",
-        "rows":         len(df_final),
-        "atm_count":    df_final["ID ATM"].nunique() if "ID ATM" in df_final.columns else 0,
-        "predictions":  len(predictions),
+        "message":     "Upload berhasil",
+        "version":     "V6.1",
+        "format":      "ZIP" if fname.lower().endswith(".zip") else "Excel/CSV",
+        "is_processed": is_processed,
+        "rows":        len(df_final),
+        "atm_count":   int(df_final["ID ATM"].nunique()) if "ID ATM" in df_final.columns else 0,
+        "predictions": len(predictions),
+        "db_synced":   db_synced,
     }
     if parse_warnings:
-        resp["warnings"] = parse_warnings[:10]
+        resp["warnings"] = parse_warnings[:15]
 
     if retrain:
         background_tasks.add_task(_do_retrain, df_final)
-        resp["retrain"] = "Dimulai di background — pantau GET /api/train/status"
+        resp["retrain"] = "Dimulai di background — cek GET /api/train/status"
 
     return resp
 
 
-# ════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════════
 #  TRAINING
-# ════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════════
 
 @app.post("/api/train", tags=["Training"])
 async def trigger_train(background_tasks: BackgroundTasks):
-    """Trigger retrain XGBoost secara manual dari data yang sudah ada."""
     if _train_state["status"] == "running":
-        raise HTTPException(409, "Training sedang berjalan, tunggu selesai dulu.")
+        raise HTTPException(409, "Training sedang berjalan.")
     if not PROCESSED_CSV.exists():
-        raise HTTPException(404, "Tidak ada data. Upload dulu via POST /api/upload")
-
-    df = pd.read_csv(PROCESSED_CSV)
+        raise HTTPException(404, "Belum ada data. Upload terlebih dahulu.")
+    df = pd.read_csv(PROCESSED_CSV, low_memory=False)
     background_tasks.add_task(_do_retrain, df)
     return {"message": "Training V6 dimulai", "monitor": "GET /api/train/status"}
 
 
 @app.get("/api/train/status", tags=["Training"])
 def get_train_status():
-    """Cek progress training."""
     return _train_state
 
 
-# ════════════════════════════════════════════════════
-#  PREDICTIONS
-# ════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════════
+#  PREDICTIONS — baca dari MySQL, fallback ke JSON cache
+# ════════════════════════════════════════════════════════════════════════════════
 
 @app.get("/api/predictions", tags=["Predictions"])
 def get_predictions(
-    wilayah: Optional[str] = Query(None, description="Filter by wilayah"),
-    status:  Optional[str] = Query(None,
-        description="Filter by status: BONGKAR | AWAS | PERLU PANTAU | AMAN | OVERFUND"),
-    tipe:    Optional[str] = Query(None, description="Filter by tipe ATM (EMV / CRM)"),
-    limit:   int           = Query(100, ge=1, le=500),
-    offset:  int           = Query(0, ge=0),
+    wilayah: Optional[str] = Query(None),
+    status:  Optional[str] = Query(None),
+    tipe:    Optional[str] = Query(None),
+    limit:   int = Query(100, ge=1, le=500),
+    offset:  int = Query(0, ge=0),
 ):
-    """
-    Seluruh prediksi ATM, diurutkan by skor_urgensi DESC.
-    Status V6: BONGKAR | AWAS | PERLU PANTAU | AMAN | OVERFUND
-    """
-    cache = load_cache()
-    if cache is None:
-        raise HTTPException(404, "Belum ada prediksi. Upload data terlebih dahulu.")
-
-    data = cache["data"]
-
-    if wilayah:
-        data = [d for d in data if wilayah.lower() in d["wilayah"].lower()]
-    if status:
-        data = [d for d in data if d["status"].lower() == status.lower()]
-    if tipe:
-        data = [d for d in data if d["tipe"].upper() == tipe.upper()]
-
-    total = len(data)
-    paged = data[offset: offset + limit]
-
-    return _sanitize({
-        "generated_at": cache.get("generated_at"),
-        "total":        total,
-        "offset":       offset,
-        "limit":        limit,
-        "data":         paged,
-    })
+    """Ambil daftar prediksi ATM. Filter by wilayah, status, tipe."""
+    try:
+        result = get_predictions_from_db(
+            wilayah=wilayah, status=status, tipe=tipe,
+            limit=limit, offset=offset
+        )
+        return _sanitize({
+            "generated_at": result["generated_at"],
+            "total":        result["total"],
+            "offset":       offset,
+            "limit":        limit,
+            "data":         result["data"],
+        })
+    except Exception:
+        # Fallback ke JSON cache
+        cache = load_cache()
+        if cache is None:
+            raise HTTPException(404, "Belum ada prediksi. Upload data terlebih dahulu.")
+        data = cache["data"]
+        if wilayah: data = [d for d in data if wilayah.lower() in d.get("wilayah", "").lower()]
+        if status:  data = [d for d in data if d.get("status", "").lower() == status.lower()]
+        if tipe:    data = [d for d in data if d.get("tipe", "").upper() == tipe.upper()]
+        return _sanitize({
+            "generated_at": cache.get("generated_at"),
+            "total":        len(data),
+            "offset":       offset,
+            "limit":        limit,
+            "data":         data[offset: offset + limit],
+        })
 
 
 @app.get("/api/predictions/{atm_id}", tags=["Predictions"])
 def get_prediction_detail(atm_id: str):
-    """Detail prediksi 1 ATM, termasuk field baru V6 (tgl_awas, cashout, pred_saldo_Xj, dll)."""
-    cache = load_cache()
-    if cache is None:
-        raise HTTPException(404, "Belum ada prediksi.")
+    """Detail prediksi untuk 1 ATM."""
+    try:
+        from database import get_conn
+        with get_conn() as conn:
+            cur = conn.cursor(dictionary=True)
+            cur.execute("SELECT * FROM predictions WHERE id_atm=%s", (atm_id.upper(),))
+            row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, f"ATM {atm_id} tidak ditemukan di database.")
+        for f in ["generated_at", "last_update", "tgl_awas", "tgl_habis", "tgl_isi"]:
+            if row.get(f):
+                row[f] = str(row[f])
+        row["atm_sepi"] = bool(row.get("atm_sepi", 0))
+        return _sanitize(row)
+    except HTTPException:
+        raise
+    except Exception:
+        # Fallback ke cache
+        cache = load_cache()
+        if cache is None:
+            raise HTTPException(404, "Belum ada prediksi.")
+        match = [d for d in cache["data"] if d["id_atm"] == atm_id.strip().upper()]
+        if not match:
+            raise HTTPException(404, f"ATM {atm_id} tidak ditemukan.")
+        return _sanitize(match[0])
 
-    match = [d for d in cache["data"] if d["id_atm"] == atm_id.strip().upper()]
-    if not match:
-        raise HTTPException(404, f"ATM {atm_id} tidak ditemukan.")
 
-    return _sanitize(match[0])
-
-
-# ════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════════
 #  ALERTS
-# ════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════════
 
 @app.get("/api/alerts", tags=["Alerts"])
-def get_alerts(
-    level: Optional[str] = Query(
-        None,
-        description="BONGKAR | AWAS | PERLU PANTAU  (default: BONGKAR + AWAS)"
-    ),
-):
-    """
-    ATM yang butuh perhatian segera.
-    V6 default: BONGKAR + AWAS (menggantikan KRITIS + SEGERA ISI dari V5)
-    """
-    cache = load_cache()
-    if cache is None:
-        raise HTTPException(404, "Belum ada prediksi.")
-
-    # V6 alert statuses
+def get_alerts(level: Optional[str] = Query(None, description="BONGKAR atau AWAS")):
+    """ATM dengan status kritis (BONGKAR / AWAS), diurutkan berdasarkan urgensi."""
     alert_statuses = ["BONGKAR", "AWAS"]
     if level:
-        alert_statuses = [level.upper()]
+        lvl = level.upper()
+        if lvl not in alert_statuses:
+            raise HTTPException(400, f"Level harus BONGKAR atau AWAS, bukan '{level}'")
+        alert_statuses = [lvl]
 
-    alerts = [d for d in cache["data"] if d["status"] in alert_statuses]
+    try:
+        results = []
+        for st in alert_statuses:
+            r = get_predictions_from_db(status=st, limit=500)
+            results.extend(r["data"])
+        results.sort(key=lambda x: x.get("skor_urgensi", 0) or 0, reverse=True)
+        gen_at = results[0].get("generated_at") if results else None
+        return _sanitize({
+            "generated_at": gen_at,
+            "total_alerts": len(results),
+            "breakdown":    {s: sum(1 for d in results if d["status"] == s) for s in alert_statuses},
+            "data":         results,
+        })
+    except Exception:
+        cache = load_cache()
+        if cache is None:
+            raise HTTPException(404, "Belum ada prediksi.")
+        alerts = [d for d in cache["data"] if d.get("status") in alert_statuses]
+        alerts.sort(key=lambda x: x.get("skor_urgensi", 0) or 0, reverse=True)
+        return _sanitize({
+            "generated_at": cache.get("generated_at"),
+            "total_alerts": len(alerts),
+            "breakdown":    {s: sum(1 for d in alerts if d.get("status") == s) for s in alert_statuses},
+            "data":         alerts,
+        })
 
-    return _sanitize({
-        "generated_at": cache.get("generated_at"),
-        "total_alerts": len(alerts),
-        "breakdown":    {s: sum(1 for d in alerts if d["status"] == s) for s in alert_statuses},
-        "data":         alerts,
-    })
 
-
-# ════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════════
 #  SUMMARY
-# ════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════════
 
 @app.get("/api/summary", tags=["Summary"])
 def get_summary():
-    """Ringkasan keseluruhan + per wilayah. Status V6."""
-    cache = load_cache()
-    if cache is None:
-        raise HTTPException(404, "Belum ada prediksi.")
+    """Ringkasan status semua ATM, dipecah per wilayah."""
+    try:
+        from database import get_conn
+        with get_conn() as conn:
+            cur = conn.cursor(dictionary=True)
+            cur.execute("""
+                SELECT
+                    COUNT(*)                            AS total_atm,
+                    SUM(status='BONGKAR')               AS bongkar,
+                    SUM(status='AWAS')                  AS awas,
+                    SUM(status='PERLU PANTAU')          AS perlu_pantau,
+                    SUM(status='AMAN')                  AS aman,
+                    SUM(status='OVERFUND')              AS overfund,
+                    SUM(atm_sepi=1)                     AS atm_sepi,
+                    ROUND(AVG(pct_saldo), 1)            AS avg_pct_saldo,
+                    MAX(generated_at)                   AS generated_at
+                FROM predictions
+            """)
+            ov_row = cur.fetchone()
 
-    data = cache["data"]
+            cur.execute("""
+                SELECT
+                    wilayah,
+                    COUNT(*)                   AS total,
+                    SUM(status='BONGKAR')      AS bongkar,
+                    SUM(status='AWAS')         AS awas,
+                    SUM(status='PERLU PANTAU') AS perlu_pantau,
+                    SUM(status='AMAN')         AS aman,
+                    SUM(status='OVERFUND')     AS overfund,
+                    SUM(atm_sepi=1)            AS atm_sepi,
+                    ROUND(AVG(pct_saldo), 1)   AS avg_pct_saldo,
+                    ROUND(AVG(skor_urgensi),1) AS avg_skor
+                FROM predictions
+                GROUP BY wilayah
+                ORDER BY AVG(skor_urgensi) DESC
+            """)
+            wilayah_rows = cur.fetchall()
 
-    # Hitung distribusi status
-    status_counts = {}
-    for d in data:
-        status_counts[d["status"]] = status_counts.get(d["status"], 0) + 1
+            cur.execute("SELECT status, COUNT(*) AS cnt FROM predictions GROUP BY status")
+            status_breakdown = {r["status"]: r["cnt"] for r in cur.fetchall()}
 
-    metode_counts = {}
-    for d in data:
-        metode_counts[d["metode"]] = metode_counts.get(d["metode"], 0) + 1
+        def _i(v): return int(v or 0)
+        def _f(v): return float(v or 0.0)
 
-    def _n(v, default=0.0):
-        if v is None: return default
-        try:
-            f = float(v)
-            return default if math.isnan(f) or math.isinf(f) else f
-        except: return default
+        overall = {
+            "total_atm":      _i(ov_row["total_atm"]),
+            "bongkar":        _i(ov_row["bongkar"]),
+            "awas":           _i(ov_row["awas"]),
+            "perlu_pantau":   _i(ov_row["perlu_pantau"]),
+            "aman":           _i(ov_row["aman"]),
+            "overfund":       _i(ov_row["overfund"]),
+            "atm_sepi":       _i(ov_row["atm_sepi"]),
+            "avg_pct_saldo":  _f(ov_row["avg_pct_saldo"]),
+            "status_breakdown": status_breakdown,
+            "kritis":         _i(ov_row["bongkar"]),
+        }
+        gen_at = (
+            ov_row["generated_at"].isoformat()
+            if ov_row.get("generated_at") else None
+        )
 
-    pct_values = [_n(d.get("pct_saldo")) for d in data]
+        per_wilayah = [
+            {
+                "wilayah":       w["wilayah"],
+                "total":         _i(w["total"]),
+                "bongkar":       _i(w["bongkar"]),
+                "awas":          _i(w["awas"]),
+                "perlu_pantau":  _i(w["perlu_pantau"]),
+                "aman":          _i(w["aman"]),
+                "overfund":      _i(w["overfund"]),
+                "atm_sepi":      _i(w["atm_sepi"]),
+                "avg_pct_saldo": _f(w["avg_pct_saldo"]),
+                "avg_skor":      _f(w["avg_skor"]),
+            }
+            for w in wilayah_rows
+        ]
 
-    overall = {
-        "total_atm":     len(data),
-        # V6 status labels
-        "bongkar":       status_counts.get("BONGKAR", 0),
-        "awas":          status_counts.get("AWAS", 0),
-        "perlu_pantau":  status_counts.get("PERLU PANTAU", 0),
-        "aman":          status_counts.get("AMAN", 0),
-        "overfund":      status_counts.get("OVERFUND", 0),
-        "no_data":       status_counts.get("NO DATA", 0),
-        "atm_sepi":      sum(1 for d in data if d.get("atm_sepi")),
-        "avg_pct_saldo": round(sum(pct_values) / max(len(pct_values), 1), 1),
-        "status_breakdown": status_counts,
-        "metode_breakdown": metode_counts,
-    }
+        return _sanitize({"generated_at": gen_at, "overall": overall, "per_wilayah": per_wilayah})
 
-    # Per wilayah
-    wilayah_map: dict = {}
-    for d in data:
-        w = d["wilayah"]
-        wilayah_map.setdefault(w, []).append(d)
+    except Exception:
+        # Fallback ke cache
+        cache = load_cache()
+        if cache is None:
+            raise HTTPException(404, "Belum ada prediksi.")
+        data = cache["data"]
 
-    per_wilayah = []
-    for w, items in wilayah_map.items():
-        pct_w  = [_n(i.get("pct_saldo"))    for i in items]
-        skor_w = [_n(i.get("skor_urgensi")) for i in items]
-        est_w  = [_n(i["est_jam"]) for i in items if i.get("est_jam") is not None]
-        per_wilayah.append({
-            "wilayah":       w,
-            "total":         len(items),
-            # V6 status labels
-            "bongkar":       sum(1 for i in items if i.get("status") == "BONGKAR"),
-            "awas":          sum(1 for i in items if i.get("status") == "AWAS"),
-            "perlu_pantau":  sum(1 for i in items if i.get("status") == "PERLU PANTAU"),
-            "aman":          sum(1 for i in items if i.get("status") == "AMAN"),
-            "atm_sepi":      sum(1 for i in items if i.get("atm_sepi")),
-            "avg_pct_saldo": round(sum(pct_w)  / max(len(pct_w),  1), 1),
-            "avg_est_jam":   round(sum(est_w)   / max(len(est_w),  1), 1),
-            "avg_skor":      round(sum(skor_w)  / max(len(skor_w), 1), 1),
+        def _n(v, default=0.0):
+            if v is None: return default
+            try:
+                f = float(v)
+                return default if (math.isnan(f) or math.isinf(f)) else f
+            except: return default
+
+        status_counts = {}
+        for d in data:
+            status_counts[d.get("status", "NO DATA")] = status_counts.get(d.get("status", "NO DATA"), 0) + 1
+
+        pct_values = [_n(d.get("pct_saldo")) for d in data]
+        overall = {
+            "total_atm":      len(data),
+            "bongkar":        status_counts.get("BONGKAR", 0),
+            "awas":           status_counts.get("AWAS", 0),
+            "perlu_pantau":   status_counts.get("PERLU PANTAU", 0),
+            "aman":           status_counts.get("AMAN", 0),
+            "overfund":       status_counts.get("OVERFUND", 0),
+            "atm_sepi":       sum(1 for d in data if d.get("atm_sepi")),
+            "avg_pct_saldo":  round(sum(pct_values) / max(len(pct_values), 1), 1),
+            "status_breakdown": status_counts,
+            "kritis":         status_counts.get("BONGKAR", 0),
+        }
+        wilayah_map = {}
+        for d in data:
+            wilayah_map.setdefault(d.get("wilayah", "Unknown"), []).append(d)
+        per_wilayah = []
+        for w, items in wilayah_map.items():
+            pcts = [_n(i.get("pct_saldo")) for i in items]
+            per_wilayah.append({
+                "wilayah":       w,
+                "total":         len(items),
+                "bongkar":       sum(1 for i in items if i.get("status") == "BONGKAR"),
+                "awas":          sum(1 for i in items if i.get("status") == "AWAS"),
+                "perlu_pantau":  sum(1 for i in items if i.get("status") == "PERLU PANTAU"),
+                "aman":          sum(1 for i in items if i.get("status") == "AMAN"),
+                "overfund":      sum(1 for i in items if i.get("status") == "OVERFUND"),
+                "atm_sepi":      sum(1 for i in items if i.get("atm_sepi")),
+                "avg_pct_saldo": round(sum(pcts) / max(len(pcts), 1), 1),
+            })
+        return _sanitize({
+            "generated_at": cache.get("generated_at"),
+            "overall": overall,
+            "per_wilayah": per_wilayah,
         })
-    per_wilayah.sort(key=lambda x: x["avg_skor"], reverse=True)
-
-    return _sanitize({
-        "generated_at": cache.get("generated_at"),
-        "overall":      overall,
-        "per_wilayah":  per_wilayah,
-    })
 
 
-# ════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════════
 #  HISTORY
-# ════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════════
 
 @app.get("/api/history/{atm_id}", tags=["History"])
-def get_atm_history(
-    atm_id: str,
-    last_n_days: int = Query(7, ge=1, le=30),
-):
-    """
-    Data historis saldo + penarikan untuk 1 ATM.
-    Status kolom menggunakan label V6 (AMAN / AWAS / BONGKAR).
-    """
-    if not PROCESSED_CSV.exists():
-        raise HTTPException(404, "Belum ada data.")
-
-    df     = pd.read_csv(PROCESSED_CSV)
-    atm_id = atm_id.strip().upper()
-    df["ID ATM"] = df["ID ATM"].astype(str).str.strip().str.upper()
-    atm_df = df[df['ID ATM'] == atm_id].copy()
-
-    if atm_df.empty:
-        raise HTTPException(404, f"ATM {atm_id} tidak ditemukan.")
-
-    atm_df['datetime'] = pd.to_datetime(atm_df['datetime'])
-    cutoff  = atm_df['datetime'].max() - pd.Timedelta(days=last_n_days)
-    atm_df  = atm_df[atm_df['datetime'] >= cutoff].sort_values('datetime')
-
-    cols = ['datetime', 'Sisa Saldo', 'Limit', 'Penarikan', 'Persentase',
-            'Is Refill', 'Is_Interpolated', 'Status']
-    cols = [c for c in cols if c in atm_df.columns]
-
-    records = atm_df[cols].rename(columns={
-        'Sisa Saldo':      'saldo',
-        'Limit':           'limit',
-        'Penarikan':       'penarikan',
-        'Persentase':      'pct',
-        'Is Refill':       'is_refill',
-        'Is_Interpolated': 'is_interpolated',
-        'Status':          'status',
-    }).to_dict(orient='records')
-
-    refill_count = int(atm_df['Is Refill'].sum()) if 'Is Refill' in atm_df.columns else 0
-
-    return _sanitize({
-        "id_atm":       atm_id,
-        "last_n_days":  last_n_days,
-        "total_rows":   len(records),
-        "refill_count": refill_count,
-        "saldo_min":    round(float(atm_df['Sisa Saldo'].min()), 0),
-        "saldo_max":    round(float(atm_df['Sisa Saldo'].max()), 0),
-        "saldo_latest": round(float(atm_df['Sisa Saldo'].iloc[-1]), 0),
-        "limit":        round(float(atm_df['Limit'].iloc[-1]), 0),
-        "data":         records,
-    })
+def get_atm_history(atm_id: str, last_n_days: int = Query(7, ge=1, le=30)):
+    """Historis saldo ATM dalam N hari terakhir."""
+    try:
+        result = get_atm_history_from_db(atm_id.strip().upper(), last_n_days)
+        if result is None:
+            raise HTTPException(404, f"ATM {atm_id} tidak ditemukan.")
+        return _sanitize(result)
+    except HTTPException:
+        raise
+    except Exception:
+        if not PROCESSED_CSV.exists():
+            raise HTTPException(404, "Belum ada data.")
+        df = pd.read_csv(PROCESSED_CSV, low_memory=False)
+        atm_id_upper = atm_id.strip().upper()
+        df["ID ATM"] = df["ID ATM"].astype(str).str.strip().str.upper()
+        atm_df = df[df["ID ATM"] == atm_id_upper].copy()
+        if atm_df.empty:
+            raise HTTPException(404, f"ATM {atm_id} tidak ditemukan.")
+        atm_df["datetime"] = pd.to_datetime(atm_df["datetime"])
+        cutoff = atm_df["datetime"].max() - pd.Timedelta(days=last_n_days)
+        atm_df = atm_df[atm_df["datetime"] >= cutoff].sort_values("datetime")
+        cols = ["datetime", "Sisa Saldo", "Limit", "Penarikan", "Persentase",
+                "Is Refill", "Is_Interpolated", "Status"]
+        cols = [c for c in cols if c in atm_df.columns]
+        records = atm_df[cols].rename(columns={
+            "Sisa Saldo": "saldo", "Limit": "limit", "Penarikan": "penarikan",
+            "Persentase": "pct", "Is Refill": "is_refill",
+            "Is_Interpolated": "is_interpolated", "Status": "status",
+        }).to_dict(orient="records")
+        return _sanitize({
+            "id_atm":       atm_id_upper,
+            "last_n_days":  last_n_days,
+            "total_rows":   len(records),
+            "refill_count": int(atm_df.get("Is Refill", pd.Series([0])).sum()),
+            "saldo_min":    float(atm_df["Sisa Saldo"].min()),
+            "saldo_max":    float(atm_df["Sisa Saldo"].max()),
+            "saldo_latest": float(atm_df["Sisa Saldo"].iloc[-1]),
+            "limit":        float(atm_df["Limit"].iloc[-1]),
+            "data":         records,
+        })
 
 
-# ════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════════
+#  ATM LIST
+# ════════════════════════════════════════════════════════════════════════════════
+
+@app.get("/api/atm-list", tags=["ATM"])
+def get_atm_list(wilayah: Optional[str] = Query(None), status: Optional[str] = Query(None)):
+    """List semua ID ATM dengan info dasar."""
+    try:
+        from database import get_conn
+        where, params = [], []
+        if wilayah:
+            where.append("wilayah LIKE %s")
+            params.append(f"%{wilayah}%")
+        if status:
+            where.append("LOWER(status) = %s")
+            params.append(status.lower())
+        where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+        with get_conn() as conn:
+            cur = conn.cursor(dictionary=True)
+            cur.execute(
+                f"SELECT id_atm, lokasi, wilayah, tipe, pct_saldo, status, skor_urgensi "
+                f"FROM predictions {where_sql} ORDER BY skor_urgensi DESC",
+                params,
+            )
+            rows = cur.fetchall()
+        return {"total": len(rows), "data": rows}
+    except Exception:
+        cache = load_cache()
+        if cache is None:
+            raise HTTPException(404, "Belum ada data.")
+        data = cache["data"]
+        if wilayah: data = [d for d in data if wilayah.lower() in d.get("wilayah", "").lower()]
+        if status:  data = [d for d in data if d.get("status", "").lower() == status.lower()]
+        return {"total": len(data), "data": [
+            {k: d[k] for k in ["id_atm", "lokasi", "wilayah", "tipe", "pct_saldo", "status", "skor_urgensi"] if k in d}
+            for d in data
+        ]}
+
+
+# ════════════════════════════════════════════════════════════════════════════════
 #  WILAYAH
-# ════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════════
 
 @app.get("/api/wilayah", tags=["Wilayah"])
 def get_wilayah():
-    """List ATM per wilayah dengan status V6."""
-    cache = load_cache()
-    if cache is None:
-        raise HTTPException(404, "Belum ada prediksi.")
+    """Daftar ATM dikelompokkan per wilayah."""
+    try:
+        from database import get_conn
+        with get_conn() as conn:
+            cur = conn.cursor(dictionary=True)
+            cur.execute("""
+                SELECT id_atm, lokasi, tipe, pct_saldo, status, skor_urgensi, atm_sepi, wilayah
+                FROM predictions ORDER BY skor_urgensi DESC
+            """)
+            rows = cur.fetchall()
 
-    result: dict = {}
-    for d in cache["data"]:
-        w = d["wilayah"]
-        result.setdefault(w, []).append({
-            "id_atm":       d["id_atm"],
-            "lokasi":       d["lokasi"],
-            "tipe":         d["tipe"],
-            "pct_saldo":    d["pct_saldo"],
-            "status":       d["status"],
-            "skor_urgensi": d["skor_urgensi"],
-            "atm_sepi":     d.get("atm_sepi", False),
-        })
+        result = {}
+        for d in rows:
+            w = d["wilayah"]
+            d["atm_sepi"] = bool(d.get("atm_sepi", 0))
+            result.setdefault(w, []).append(d)
 
-    return _sanitize({
-        "wilayah_list": list(result.keys()),
-        "data":         result,
-    })
+        return _sanitize({"wilayah_list": list(result.keys()), "data": result})
+    except Exception:
+        cache = load_cache()
+        if cache is None:
+            raise HTTPException(404, "Belum ada prediksi.")
+        result = {}
+        for d in cache["data"]:
+            w = d.get("wilayah", "Unknown")
+            result.setdefault(w, []).append({
+                "id_atm": d["id_atm"], "lokasi": d.get("lokasi"),
+                "tipe": d.get("tipe"), "pct_saldo": d.get("pct_saldo"),
+                "status": d.get("status"), "skor_urgensi": d.get("skor_urgensi"),
+                "atm_sepi": d.get("atm_sepi", False),
+            })
+        return _sanitize({"wilayah_list": list(result.keys()), "data": result})
 
 
-# ════════════════════════════════════════════════════
-#  DEBUG
-# ════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════════
+#  CASHPLAN
+# ════════════════════════════════════════════════════════════════════════════════
 
-@app.get("/api/debug/atm_ids", tags=["Debug"])
-def debug_atm_ids():
-    """Cek ID ATM, Vendor, Wilayah di processed_data.csv."""
-    if not PROCESSED_CSV.exists():
-        raise HTTPException(404, "Belum ada data.")
+class CashplanAddRequest(BaseModel):
+    id_atm:       str
+    lokasi:       str = "-"
+    wilayah:      str = "-"
+    tipe:         str = "-"
+    saldo:        int = 0
+    limit:        int = 0
+    pct_saldo:    float = 0
+    status:       str = "AWAS"
+    tgl_isi:      Optional[str] = None
+    jam_isi:      Optional[str] = None
+    est_jam:      Optional[float] = None
+    skor_urgensi: float = 0
+    denom:        int = 100000
+    added_by:     str = "user"
 
-    df = pd.read_csv(PROCESSED_CSV, low_memory=False)
-    df["ID ATM"] = df["ID ATM"].astype(str).str.strip().str.upper()
-    df = df[~df["ID ATM"].isin(["", "NAN", "NONE", "NULL", "ID ATM"])]
 
-    result = {
-        "total_rows": len(df),
-        "total_atm":  df["ID ATM"].nunique(),
-        "date_range": {
-            "from": str(df["Tanggal"].min()) if "Tanggal" in df.columns else "-",
-            "to":   str(df["Tanggal"].max()) if "Tanggal" in df.columns else "-",
-        },
+class CashplanStatusUpdate(BaseModel):
+    status:      str
+    keterangan:  Optional[str] = None
+    denom:       Optional[int] = None
+
+
+@app.post("/api/cashplan", tags=["CashPlan"])
+def api_add_cashplan(req: CashplanAddRequest):
+    """Tambah ATM ke antrian Cash Plan."""
+    try:
+        cp_id = add_to_cashplan(req.dict())
+        return {"message": "Berhasil ditambahkan", "cashplan_id": cp_id}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.get("/api/cashplan", tags=["CashPlan"])
+def api_get_cashplan(status: str = Query("PENDING")):
+    """List cashplan berdasarkan status (PENDING / DONE / REMOVED)."""
+    try:
+        items = get_cashplan_list(status.upper())
+        return {"total": len(items), "data": items}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.patch("/api/cashplan/{cashplan_id}/status", tags=["CashPlan"])
+def api_update_cashplan_status(cashplan_id: int, body: CashplanStatusUpdate):
+    STATUS_MAP = {
+        "DONE":    "DONE",
+        "REMOVED": "REMOVED",
+        "SELESAI": "DONE",
+        "BATAL":   "REMOVED",
     }
-
-    if "Vendor" in df.columns:
-        result["vendor_unique"] = sorted(df["Vendor"].dropna().unique().tolist())
-
-    if "Wilayah" in df.columns:
-        result["wilayah_atm_count"] = df.groupby("Wilayah")["ID ATM"].nunique().to_dict()
-
-    if "Tanggal" in df.columns:
-        tgl_counts = df.groupby("Tanggal")["ID ATM"].nunique().to_dict()
-        result["atm_per_tanggal_sample"] = dict(list(tgl_counts.items())[:10])
-
-    # Distribusi status V6
-    if "Status" in df.columns:
-        # Ambil snapshot terbaru per ATM
-        df["datetime"] = pd.to_datetime(df.get("datetime", pd.NaT), errors='coerce')
-        latest = df.loc[df.groupby("ID ATM")["datetime"].idxmax()]
-        result["status_distribution_v6"] = latest["Status"].value_counts().to_dict()
-
-    return result
+    mapped = STATUS_MAP.get(body.status.upper())
+    if not mapped:
+        raise HTTPException(400, f"Status harus salah satu dari: {set(STATUS_MAP.keys())}")
+    try:
+        result = update_cashplan_status(
+            cashplan_id, mapped,
+            keterangan=body.keterangan,
+            denom=body.denom,
+        )
+        return {"message": f"Status diubah ke {body.status.upper()}", **result}
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    except Exception as e:
+        raise HTTPException(500, str(e))
 
 
-# ════════════════════════════════════════════════════
-#  RESET
-# ════════════════════════════════════════════════════
+@app.delete("/api/cashplan/{cashplan_id}", tags=["CashPlan"])
+def api_remove_cashplan(cashplan_id: int):
+    """Hapus (soft delete) satu item cashplan dari antrian. Tidak masuk rekap."""
+    try:
+        remove_cashplan_only(cashplan_id)
+        return {"message": "Cashplan dihapus dari antrian", "cashplan_id": cashplan_id}
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+#  REKAP REPLACEMENT
+# ════════════════════════════════════════════════════════════════════════════════
+class RekapUpdateRequest(BaseModel):
+    tgl_isi:      Optional[str] = None
+    jam_cash_in:  Optional[str] = None
+    jam_cash_out: Optional[str] = None
+    denom:        Optional[int] = None
+
+@app.patch("/api/rekap-replacement/{rekap_id}", tags=["Rekap"])
+def api_update_rekap(rekap_id: int, body: RekapUpdateRequest):
+    """Simpan jam cash in/out, tanggal isi, denom ke rekap_replacement."""
+    try:
+        result = update_rekap_replacement(
+            rekap_id,
+            tgl_isi=body.tgl_isi,
+            jam_cash_in=body.jam_cash_in,
+            jam_cash_out=body.jam_cash_out,
+            denom=body.denom,
+        )
+        return {"message": "Rekap berhasil disimpan", **result}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+    
+@app.get("/api/rekap-replacement", tags=["Rekap"])
+def api_get_rekap(
+    bulan:   Optional[str] = Query(None, description="Nama bulan Indonesia, e.g. Januari"),
+    tahun:   Optional[int] = Query(None),
+    wilayah: Optional[str] = Query(None),
+):
+    """Daftar ATM yang sudah DONE dari Cash Plan."""
+    try:
+        items = get_rekap_replacement(bulan=bulan, tahun=tahun, wilayah=wilayah)
+        return _sanitize({"total": len(items), "data": items})
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+#  ADMIN
+# ════════════════════════════════════════════════════════════════════════════════
+
+@app.post("/api/clear-cache", tags=["Admin"])
+async def clear_cache():
+    """Hapus JSON prediction cache."""
+    if PRED_CACHE.exists():
+        PRED_CACHE.unlink()
+        return {"message": "Cache dibersihkan"}
+    return {"message": "Cache sudah kosong"}
+
 
 @app.delete("/api/data", tags=["Admin"])
 def reset_all():
-    """Hapus semua data, model, dan cache. HATI-HATI!"""
+    """Reset semua data lokal (CSV, cache, model). MySQL tidak disentuh."""
     removed = []
     for p in [PROCESSED_CSV, PRED_CACHE, MODEL_PATH, FITUR_PATH]:
         if p.exists():
             p.unlink()
             removed.append(str(p))
-
     _train_state.update({
-        "status": "idle", "progress": 0,
-        "message": "", "last_trained": None, "last_result": None,
+        "status": "idle", "progress": 0, "message": "",
+        "last_trained": None, "last_result": None,
     })
-
     return {"message": "Reset berhasil", "removed_files": removed}
 
 
-# ════════════════════════════════════════════════════
-#  BACKGROUND TASK
-# ════════════════════════════════════════════════════
+@app.get("/api/debug/atm_ids", tags=["Debug"])
+def debug_atm_ids():
+    """Info debug: daftar ID ATM, vendor, wilayah dari CSV processed."""
+    if not PROCESSED_CSV.exists():
+        raise HTTPException(404, "Belum ada data.")
+    df = pd.read_csv(PROCESSED_CSV, low_memory=False)
+    df["ID ATM"] = df["ID ATM"].astype(str).str.strip().str.upper()
+    df = df[~df["ID ATM"].isin(["", "NAN", "NONE", "NULL", "ID ATM"])]
+    result: dict = {"total_rows": len(df), "total_atm": df["ID ATM"].nunique()}
+    if "Vendor"  in df.columns:
+        result["vendor_unique"] = sorted(df["Vendor"].dropna().unique().tolist())
+    if "Wilayah" in df.columns:
+        result["wilayah_atm_count"] = df.groupby("Wilayah")["ID ATM"].nunique().to_dict()
+    if "Status" in df.columns:
+        latest = df.sort_values("datetime").drop_duplicates("ID ATM", keep="last") if "datetime" in df.columns else df.drop_duplicates("ID ATM")
+        result["status_distribution"] = latest["Status"].value_counts().to_dict()
+    return result
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+#  BACKGROUND TASK — training
+# ════════════════════════════════════════════════════════════════════════════════
 
 async def _do_retrain(df: pd.DataFrame):
-    """Background task untuk training XGBoost V6."""
     _train_state.update({"status": "running", "progress": 0, "message": "Memulai training V6..."})
 
     def _cb(pct, msg):
@@ -850,7 +1148,7 @@ async def _do_retrain(df: pd.DataFrame):
         _train_state["message"]  = msg
 
     try:
-        if 'Avg Penarikan 6j' not in df.columns:
+        if "Avg Penarikan 6j" not in df.columns:
             _cb(5, "Processing data...")
             df = process_dataframe(df)
 
@@ -861,13 +1159,17 @@ async def _do_retrain(df: pd.DataFrame):
         predictions = build_predictions(df)
         save_cache(predictions)
 
+        try:
+            upsert_predictions(predictions)
+        except Exception as e:
+            _train_state["message"] += f" | DB sync warning: {e}"
+
         _train_state.update({
             "status":       "done",
             "progress":     100,
             "message":      (
-                f"Training V6 selesai ✅ MAE={result.get('mae_avg')} jam | R²={result.get('r2_avg')}"
-                if result.get('mae_avg') is not None
-                else "Training V6 selesai ✅ (Rule-Based — data kurang)"
+                f"Training V6 selesai ✅ "
+                f"MAE={result.get('mae_avg')} jam | R²={result.get('r2_avg')}"
             ),
             "last_trained": datetime.now().isoformat(),
             "last_result":  result,
@@ -876,5 +1178,5 @@ async def _do_retrain(df: pd.DataFrame):
         _train_state.update({
             "status":   "error",
             "progress": 0,
-            "message":  f"Error: {str(e)}",
+            "message":  f"Error training: {str(e)}",
         })
