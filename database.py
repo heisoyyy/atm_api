@@ -1,8 +1,10 @@
 """
 database.py — MySQL connection pool + helpers
-Fix V6.3:
-  - log_upload: kolom 'rows' → 'total_rows' (sesuai schema baru)
-  - update_cashplan_status: bulan pakai nama Indonesia, bukan English
+Fix V6.4:
+  - remove_cashplan_only: set status_done='REMOVED' agar bisa dibedakan
+    dari BATAL (status_done='BATAL') di frontend
+  - log_upload: kolom 'rows' → 'total_rows' (sesuai schema v6.3)
+  - update_cashplan_status: bulan pakai nama Indonesia
   - add_to_cashplan: normalisasi id_atm uppercase
 """
 
@@ -204,9 +206,6 @@ def get_predictions_from_db(
 def bulk_insert_history(df_history):
     import pandas as pd
 
-    # HAPUS TRUNCATE — data lama tidak boleh dihapus
-    # GANTI ke INSERT IGNORE agar duplikat di-skip otomatis
-
     sql = """
     INSERT IGNORE INTO atm_history
         (id_atm, recorded_at, saldo, `limit`, penarikan, pct_saldo,
@@ -351,7 +350,6 @@ def get_cashplan_list(status: str = "PENDING") -> list:
             r["tgl_isi"] = str(r["tgl_isi"])
         r["saldo"] = int(r["saldo"]) if r.get("saldo") is not None else 0
         r["limit"] = int(r["limit"]) if r.get("limit") is not None else 0
-        # status_done sudah ada dari SELECT *, tidak perlu tambah manual
     return rows
 
 
@@ -371,7 +369,7 @@ def update_cashplan_status(
     if not item:
         raise ValueError(f"Cashplan id {cashplan_id} tidak ditemukan")
 
-    # Label display untuk disimpan
+    # Label display: DONE → SELESAI, REMOVED (via tombol Batal) → BATAL
     status_done_label = "SELESAI" if new_status == "DONE" else "BATAL"
 
     updates = {
@@ -390,11 +388,10 @@ def update_cashplan_status(
 
     if new_status == "DONE":
         updates["done_at"] = now
-
     elif new_status == "REMOVED":
         updates["removed_at"] = now
 
-    # Kedua status (DONE dan REMOVED) masuk ke rekap_replacement
+    # Kedua status (DONE dan REMOVED via Batal) masuk ke rekap_replacement
     rekap_sql = """
     INSERT INTO rekap_replacement
         (cashplan_id, id_atm, lokasi, wilayah, tipe,
@@ -437,13 +434,16 @@ def update_cashplan_status(
     return {"cashplan_id": cashplan_id, "new_status": new_status, "status_done": status_done_label}
 
 
-# Ganti fungsi remove_cashplan yang lama dengan ini:
-
 def remove_cashplan_only(cashplan_id: int):
     """
-    Hapus item dari antrian cashplan — TANPA insert ke rekap_replacement.
-    Berbeda dengan update_cashplan_status(REMOVED) yang dipakai tombol Batal
-    dan menyimpan rekam jejak ke rekap_replacement.
+    Hapus item dari antrian cashplan via tombol ✕ Remove.
+    - status_cashplan = 'REMOVED'
+    - status_done     = 'REMOVED'   ← marker khusus, berbeda dari 'BATAL'
+    - TIDAK insert ke rekap_replacement
+    
+    Perbedaan dengan update_cashplan_status(REMOVED):
+      update_cashplan_status → dipanggil tombol Batal → status_done='BATAL' → masuk rekap
+      remove_cashplan_only   → dipanggil tombol Remove → status_done='REMOVED' → tidak masuk rekap
     """
     with get_conn() as conn:
         cur = conn.cursor(dictionary=True)
@@ -455,7 +455,11 @@ def remove_cashplan_only(cashplan_id: int):
 
     with get_conn() as conn:
         conn.cursor().execute(
-            "UPDATE cashplan SET status_cashplan='REMOVED', removed_at=%s WHERE id=%s",
+            """UPDATE cashplan
+               SET status_cashplan='REMOVED',
+                   status_done='REMOVED',
+                   removed_at=%s
+               WHERE id=%s""",
             (datetime.now(), cashplan_id)
         )
 
@@ -521,7 +525,7 @@ def get_rekap_replacement(
 
 
 # ══════════════════════════════════════════════════════════
-#  UPLOAD LOG — FIX: kolom total_rows (schema v6.3)
+#  UPLOAD LOG
 # ══════════════════════════════════════════════════════════
 
 def log_upload(
@@ -533,7 +537,6 @@ def log_upload(
     retrain: bool,
     notes: str = None,
 ):
-    # FIX: 'rows' → 'total_rows' sesuai schema v6.3
     sql = """
     INSERT INTO upload_log
         (filename, format, total_rows, atm_count, predictions, retrain, notes)
