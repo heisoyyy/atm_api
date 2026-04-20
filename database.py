@@ -1,13 +1,3 @@
-"""
-database.py — MySQL connection pool + helpers
-Fix V6.4:
-  - remove_cashplan_only: set status_done='REMOVED' agar bisa dibedakan
-    dari BATAL (status_done='BATAL') di frontend
-  - log_upload: kolom 'rows' → 'total_rows' (sesuai schema v6.3)
-  - update_cashplan_status: bulan pakai nama Indonesia
-  - add_to_cashplan: normalisasi id_atm uppercase
-"""
-
 from contextlib import contextmanager
 from datetime import datetime
 import math
@@ -48,12 +38,13 @@ def get_conn():
 
 
 def _s(v):
+    """Sanitize NaN/Inf → None untuk JSON & MySQL safety."""
     if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
         return None
     return v
 
 
-# ── Bulan Indonesia ────────────────────────────────────────
+# ── Bulan Indonesia ────────────────────────────────────────────────────────────
 _BULAN_MAP = {
     "January": "Januari", "February": "Februari", "March": "Maret",
     "April": "April", "May": "Mei", "June": "Juni",
@@ -65,55 +56,73 @@ def _bulan_id(dt: datetime) -> str:
     return _BULAN_MAP.get(dt.strftime("%B"), dt.strftime("%B"))
 
 
-# ══════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
 #  PREDICTIONS
-# ══════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
 
 def upsert_predictions(predictions: list):
+    """
+    UPSERT semua prediksi ATM ke tabel predictions.
+    Jika id_atm sudah ada → update semua kolom.
+    """
     if not predictions:
         return
 
     sql = """
-    INSERT INTO predictions (
-        id_atm, tipe, lokasi, wilayah,
-        saldo, `limit`, pct_saldo, tarik_per_jam,
-        cashout_harian, cashout_mingguan, cashout_bulanan,
-        pred_saldo_6j, pred_saldo_12j, pred_saldo_24j, pred_saldo_48j, pred_saldo_72j,
-        est_jam, est_hari,
-        tgl_awas, jam_awas, tgl_habis, jam_habis, tgl_isi, jam_isi,
-        rekomendasi_isi, status, skor_urgensi, ranking,
-        atm_sepi, metode, last_update, generated_at
-    ) VALUES (
-        %(id_atm)s, %(tipe)s, %(lokasi)s, %(wilayah)s,
-        %(saldo)s, %(limit)s, %(pct_saldo)s, %(tarik_per_jam)s,
-        %(cashout_harian)s, %(cashout_mingguan)s, %(cashout_bulanan)s,
-        %(pred_saldo_6j)s, %(pred_saldo_12j)s, %(pred_saldo_24j)s,
-        %(pred_saldo_48j)s, %(pred_saldo_72j)s,
-        %(est_jam)s, %(est_hari)s,
-        %(tgl_awas)s, %(jam_awas)s, %(tgl_habis)s, %(jam_habis)s,
-        %(tgl_isi)s, %(jam_isi)s,
-        %(rekomendasi_isi)s, %(status)s, %(skor_urgensi)s, %(ranking)s,
-        %(atm_sepi)s, %(metode)s, %(last_update)s, %(generated_at)s
-    )
-    ON DUPLICATE KEY UPDATE
-        tipe=VALUES(tipe), lokasi=VALUES(lokasi), wilayah=VALUES(wilayah),
-        saldo=VALUES(saldo), `limit`=VALUES(`limit`),
-        pct_saldo=VALUES(pct_saldo), tarik_per_jam=VALUES(tarik_per_jam),
-        cashout_harian=VALUES(cashout_harian),
-        cashout_mingguan=VALUES(cashout_mingguan),
-        cashout_bulanan=VALUES(cashout_bulanan),
-        pred_saldo_6j=VALUES(pred_saldo_6j), pred_saldo_12j=VALUES(pred_saldo_12j),
-        pred_saldo_24j=VALUES(pred_saldo_24j), pred_saldo_48j=VALUES(pred_saldo_48j),
-        pred_saldo_72j=VALUES(pred_saldo_72j),
-        est_jam=VALUES(est_jam), est_hari=VALUES(est_hari),
-        tgl_awas=VALUES(tgl_awas), jam_awas=VALUES(jam_awas),
-        tgl_habis=VALUES(tgl_habis), jam_habis=VALUES(jam_habis),
-        tgl_isi=VALUES(tgl_isi), jam_isi=VALUES(jam_isi),
-        rekomendasi_isi=VALUES(rekomendasi_isi),
-        status=VALUES(status), skor_urgensi=VALUES(skor_urgensi),
-        ranking=VALUES(ranking), atm_sepi=VALUES(atm_sepi),
-        metode=VALUES(metode), last_update=VALUES(last_update),
-        generated_at=VALUES(generated_at)
+        INSERT INTO predictions (
+            id_atm, tipe, denom_options, lokasi, wilayah,
+            saldo, `limit`, pct_saldo, tarik_per_jam,
+            cashout_harian, cashout_mingguan, cashout_bulanan,
+            pred_saldo_6j, pred_saldo_12j, pred_saldo_24j, pred_saldo_48j, pred_saldo_72j,
+            est_jam, est_hari,
+            tgl_awas, jam_awas, tgl_habis, jam_habis, tgl_isi, jam_isi,
+            rekomendasi_isi, status, skor_urgensi, ranking,
+            atm_sepi, metode, last_update, generated_at
+        ) VALUES (
+            %(id_atm)s, %(tipe)s, %(denom_options)s, %(lokasi)s, %(wilayah)s,
+            %(saldo)s, %(limit)s, %(pct_saldo)s, %(tarik_per_jam)s,
+            %(cashout_harian)s, %(cashout_mingguan)s, %(cashout_bulanan)s,
+            %(pred_saldo_6j)s, %(pred_saldo_12j)s, %(pred_saldo_24j)s,
+            %(pred_saldo_48j)s, %(pred_saldo_72j)s,
+            %(est_jam)s, %(est_hari)s,
+            %(tgl_awas)s, %(jam_awas)s, %(tgl_habis)s, %(jam_habis)s,
+            %(tgl_isi)s, %(jam_isi)s,
+            %(rekomendasi_isi)s, %(status)s, %(skor_urgensi)s, %(ranking)s,
+            %(atm_sepi)s, %(metode)s, %(last_update)s, %(generated_at)s
+        )
+        ON DUPLICATE KEY UPDATE
+            tipe            = VALUES(tipe),
+            denom_options   = VALUES(denom_options),
+            lokasi          = VALUES(lokasi),
+            wilayah         = VALUES(wilayah),
+            saldo           = VALUES(saldo),
+            `limit`         = VALUES(`limit`),
+            pct_saldo       = VALUES(pct_saldo),
+            tarik_per_jam   = VALUES(tarik_per_jam),
+            cashout_harian  = VALUES(cashout_harian),
+            cashout_mingguan= VALUES(cashout_mingguan),
+            cashout_bulanan = VALUES(cashout_bulanan),
+            pred_saldo_6j   = VALUES(pred_saldo_6j),
+            pred_saldo_12j  = VALUES(pred_saldo_12j),
+            pred_saldo_24j  = VALUES(pred_saldo_24j),
+            pred_saldo_48j  = VALUES(pred_saldo_48j),
+            pred_saldo_72j  = VALUES(pred_saldo_72j),
+            est_jam         = VALUES(est_jam),
+            est_hari        = VALUES(est_hari),
+            tgl_awas        = VALUES(tgl_awas),
+            jam_awas        = VALUES(jam_awas),
+            tgl_habis       = VALUES(tgl_habis),
+            jam_habis       = VALUES(jam_habis),
+            tgl_isi         = VALUES(tgl_isi),
+            jam_isi         = VALUES(jam_isi),
+            rekomendasi_isi = VALUES(rekomendasi_isi),
+            status          = VALUES(status),
+            skor_urgensi    = VALUES(skor_urgensi),
+            ranking         = VALUES(ranking),
+            atm_sepi        = VALUES(atm_sepi),
+            metode          = VALUES(metode),
+            last_update     = VALUES(last_update),
+            generated_at    = VALUES(generated_at)
     """
 
     now = datetime.now().isoformat()
@@ -122,6 +131,7 @@ def upsert_predictions(predictions: list):
         rows.append({
             "id_atm":           p.get("id_atm"),
             "tipe":             p.get("tipe", "-"),
+            "denom_options":    p.get("denom_options", "100000") or "100000",
             "lokasi":           p.get("lokasi", "-"),
             "wilayah":          p.get("wilayah", "-"),
             "saldo":            _s(p.get("saldo", 0)),
@@ -155,8 +165,7 @@ def upsert_predictions(predictions: list):
         })
 
     with get_conn() as conn:
-        cur = conn.cursor()
-        cur.executemany(sql, rows)
+        conn.cursor().executemany(sql, rows)
 
 
 def get_predictions_from_db(
@@ -181,7 +190,8 @@ def get_predictions_from_db(
         cur.execute(f"SELECT COUNT(*) AS cnt FROM predictions {where_sql}", params)
         total = cur.fetchone()["cnt"]
         cur.execute(
-            f"SELECT * FROM predictions {where_sql} ORDER BY skor_urgensi DESC LIMIT %s OFFSET %s",
+            f"SELECT * FROM predictions {where_sql} "
+            f"ORDER BY skor_urgensi DESC LIMIT %s OFFSET %s",
             params + [limit, offset],
         )
         rows = cur.fetchall()
@@ -199,9 +209,9 @@ def get_predictions_from_db(
     return {"total": total, "data": rows, "generated_at": gen_at}
 
 
-# ══════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
 #  ATM HISTORY
-# ══════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
 
 def bulk_insert_history(df_history):
     import pandas as pd
@@ -212,18 +222,8 @@ def bulk_insert_history(df_history):
          is_refill, is_interpolated, status)
     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
     """
-    cols = {
-        "ID ATM": "id_atm", "datetime": "recorded_at",
-        "Sisa Saldo": "saldo", "Limit": "limit",
-        "Penarikan": "penarikan", "Persentase": "pct_saldo",
-        "Is Refill": "is_refill", "Is_Interpolated": "is_interpolated",
-        "Status": "status",
-    }
-    available = [c for c in cols if c in df_history.columns]
-    df_sub = df_history[available].copy()
-
     batch = []
-    for _, row in df_sub.iterrows():
+    for _, row in df_history.iterrows():
         try:
             recorded_at = pd.to_datetime(row.get("datetime", None))
         except Exception:
@@ -282,16 +282,19 @@ def get_atm_history_from_db(atm_id: str, last_n_days: int = 7) -> dict:
     }
 
 
-# ══════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
 #  CASHPLAN
-# ══════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
 
 def add_to_cashplan(atm_data: dict) -> int:
+    """
+    Tambah ATM ke cashplan. Jika sudah ada PENDING → return id yang ada.
+    added_by: 'system' | 'notif' | 'manual' | 'history'
+    """
     id_atm = str(atm_data.get("id_atm", "")).strip().upper()
     if not id_atm:
         raise ValueError("id_atm tidak boleh kosong")
 
-    # Cek duplikasi PENDING
     with get_conn() as conn:
         cur = conn.cursor(dictionary=True)
         cur.execute(
@@ -304,31 +307,34 @@ def add_to_cashplan(atm_data: dict) -> int:
 
     jumlah = max(0, int(atm_data.get("limit", 0)) - int(atm_data.get("saldo", 0)))
 
+    # FIX: urutan kolom dan VALUES harus SAMA PERSIS
     sql = """
-    INSERT INTO cashplan
-        (id_atm, lokasi, wilayah, tipe, saldo, `limit`, pct_saldo,
-         status_awal, jumlah_isi, denom, tgl_isi, jam_isi, est_jam,
-         skor_urgensi, added_by)
-    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        INSERT INTO cashplan
+            (id_atm, lokasi, wilayah, tipe, denom_options,
+             saldo, `limit`, pct_saldo,
+             status_awal, jumlah_isi, denom,
+             tgl_isi, jam_isi, est_jam, skor_urgensi, added_by)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     """
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute(sql, (
-            id_atm,
-            atm_data.get("lokasi", "-"),
-            atm_data.get("wilayah", "-"),
-            atm_data.get("tipe", "-"),
-            int(atm_data.get("saldo", 0)),
-            int(atm_data.get("limit", 0)),
-            float(atm_data.get("pct_saldo", 0)),
-            atm_data.get("status", "AWAS"),
-            jumlah,
-            int(atm_data.get("denom", 100000)),
-            atm_data.get("tgl_isi"),
-            atm_data.get("jam_isi"),
-            float(atm_data.get("est_jam", 0) or 0),
-            float(atm_data.get("skor_urgensi", 0) or 0),
-            atm_data.get("added_by", "system"),
+            id_atm,                                          # id_atm
+            atm_data.get("lokasi", "-"),                     # lokasi
+            atm_data.get("wilayah", "-"),                    # wilayah
+            atm_data.get("tipe", "-"),                       # tipe
+            atm_data.get("denom_options", "100000") or "100000",  # denom_options
+            int(atm_data.get("saldo", 0)),                   # saldo
+            int(atm_data.get("limit", 0)),                   # limit
+            float(atm_data.get("pct_saldo", 0)),             # pct_saldo
+            atm_data.get("status", "AWAS"),                  # status_awal
+            jumlah,                                          # jumlah_isi
+            int(atm_data.get("denom", 100000)),              # denom
+            atm_data.get("tgl_isi"),                         # tgl_isi
+            atm_data.get("jam_isi"),                         # jam_isi
+            float(atm_data.get("est_jam", 0) or 0),          # est_jam
+            float(atm_data.get("skor_urgensi", 0) or 0),     # skor_urgensi
+            atm_data.get("added_by", "system"),              # added_by
         ))
         return cur.lastrowid
 
@@ -359,6 +365,11 @@ def update_cashplan_status(
     keterangan: str = None,
     denom: int = None,
 ) -> dict:
+    """
+    Update status cashplan dan insert ke rekap_replacement.
+    new_status: 'DONE' (SELESAI) | 'REMOVED' (BATAL via tombol Batal)
+    Keduanya masuk rekap_replacement dengan status_done berbeda.
+    """
     now = datetime.now()
 
     with get_conn() as conn:
@@ -369,9 +380,48 @@ def update_cashplan_status(
     if not item:
         raise ValueError(f"Cashplan id {cashplan_id} tidak ditemukan")
 
-    # Label display: DONE → SELESAI, REMOVED (via tombol Batal) → BATAL
+    # SELESAI → DONE, BATAL → REMOVED di rekap
     status_done_label = "SELESAI" if new_status == "DONE" else "BATAL"
 
+    jumlah_isi = int(item.get("jumlah_isi", 0))
+    denom_val  = denom or int(item.get("denom", 100000))
+    lembar     = math.ceil(jumlah_isi / denom_val) if denom_val > 0 else 0
+    bulan_str  = _bulan_id(now)
+
+    # FIX: urutan kolom dan VALUES SAMA PERSIS
+    rekap_sql = """
+        INSERT INTO rekap_replacement
+            (cashplan_id, id_atm, lokasi, wilayah, tipe, denom_options,
+             saldo_awal, `limit`, jumlah_isi, denom, lembar,
+             keterangan, status_awal, status_done,
+             tgl_isi, jam_isi, done_at, bulan, tahun)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    """
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(rekap_sql, (
+            cashplan_id,                                          # cashplan_id
+            item["id_atm"],                                       # id_atm
+            item.get("lokasi", "-"),                              # lokasi
+            item.get("wilayah", "-"),                             # wilayah
+            item.get("tipe", "-"),                                # tipe
+            item.get("denom_options", "100000") or "100000",      # denom_options
+            int(item["saldo"]),                                   # saldo_awal
+            int(item["limit"]),                                   # limit
+            jumlah_isi,                                           # jumlah_isi
+            denom_val,                                            # denom
+            lembar,                                               # lembar
+            keterangan or item.get("keterangan"),                 # keterangan
+            item.get("status_awal", "AWAS"),                      # status_awal
+            status_done_label,                                    # status_done
+            item.get("tgl_isi"),                                  # tgl_isi
+            item.get("jam_isi"),                                  # jam_isi
+            now,                                                  # done_at
+            bulan_str,                                            # bulan
+            now.year,                                             # tahun
+        ))
+
+    # Update cashplan row
     updates = {
         "status_cashplan": new_status,
         "status_done":     status_done_label,
@@ -380,50 +430,11 @@ def update_cashplan_status(
         updates["keterangan"] = keterangan
     if denom is not None:
         updates["denom"] = denom
-
-    jumlah_isi = int(item.get("jumlah_isi", 0))
-    denom_val  = denom or int(item.get("denom", 100000))
-    lembar     = math.ceil(jumlah_isi / denom_val) if denom_val > 0 else 0
-    bulan_str  = _bulan_id(now)
-
     if new_status == "DONE":
         updates["done_at"] = now
-    elif new_status == "REMOVED":
+    else:
         updates["removed_at"] = now
 
-    # Kedua status (DONE dan REMOVED via Batal) masuk ke rekap_replacement
-    rekap_sql = """
-    INSERT INTO rekap_replacement
-        (cashplan_id, id_atm, lokasi, wilayah, tipe,
-         saldo_awal, `limit`, jumlah_isi, denom, lembar,
-         keterangan, status_awal, status_done, tgl_isi, jam_isi, done_at,
-         bulan, tahun)
-    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-    """
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute(rekap_sql, (
-            cashplan_id,
-            item["id_atm"],
-            item.get("lokasi", "-"),
-            item.get("wilayah", "-"),
-            item.get("tipe", "-"),
-            int(item["saldo"]),
-            int(item["limit"]),
-            jumlah_isi,
-            denom_val,
-            lembar,
-            keterangan or item.get("keterangan"),
-            item.get("status_awal", "AWAS"),
-            status_done_label,
-            item.get("tgl_isi"),
-            item.get("jam_isi"),
-            now,
-            bulan_str,
-            now.year,
-        ))
-
-    # Update cashplan
     set_parts = ", ".join(f"{k}=%s" for k in updates)
     vals = list(updates.values()) + [cashplan_id]
     with get_conn() as conn:
@@ -431,19 +442,19 @@ def update_cashplan_status(
             f"UPDATE cashplan SET {set_parts} WHERE id=%s", vals
         )
 
-    return {"cashplan_id": cashplan_id, "new_status": new_status, "status_done": status_done_label}
+    return {
+        "cashplan_id":  cashplan_id,
+        "new_status":   new_status,
+        "status_done":  status_done_label,
+    }
 
 
 def remove_cashplan_only(cashplan_id: int):
     """
-    Hapus item dari antrian cashplan via tombol ✕ Remove.
+    Hapus item dari antrian cashplan via tombol ✕ Remove (data salah input).
     - status_cashplan = 'REMOVED'
-    - status_done     = 'REMOVED'   ← marker khusus, berbeda dari 'BATAL'
+    - status_done     = 'REMOVED'   ← berbeda dari 'BATAL'
     - TIDAK insert ke rekap_replacement
-    
-    Perbedaan dengan update_cashplan_status(REMOVED):
-      update_cashplan_status → dipanggil tombol Batal → status_done='BATAL' → masuk rekap
-      remove_cashplan_only   → dipanggil tombol Remove → status_done='REMOVED' → tidak masuk rekap
     """
     with get_conn() as conn:
         cur = conn.cursor(dictionary=True)
@@ -464,9 +475,155 @@ def remove_cashplan_only(cashplan_id: int):
         )
 
 
-# ══════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+#  NOTIF CASHPLAN  (bell notif — rekomendasi sistem)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def upsert_notif_cashplan(atm_data: dict):
+    """
+    Insert atau update notif untuk ATM dari hasil prediksi sistem.
+    Jika ATM sudah ada PENDING → UPDATE data terbaru (saldo, pct, skor bisa berubah).
+    Jika tidak ada PENDING → INSERT baru.
+    """
+    id_atm = str(atm_data.get("id_atm", "")).strip().upper()
+
+    with get_conn() as conn:
+        cur = conn.cursor(dictionary=True)
+        cur.execute(
+            "SELECT id FROM notif_cashplan WHERE id_atm=%s AND status_notif='PENDING'",
+            (id_atm,)
+        )
+        existing = cur.fetchone()
+
+    if existing:
+        # Update data terbaru (saldo/pct bisa berubah tiap upload)
+        with get_conn() as conn:
+            conn.cursor().execute(
+                """UPDATE notif_cashplan
+                   SET saldo=%s, `limit`=%s, pct_saldo=%s, skor_urgensi=%s,
+                       est_jam=%s, status_awal=%s, denom_options=%s,
+                       created_at=%s
+                   WHERE id=%s""",
+                (
+                    int(atm_data.get("saldo", 0)),
+                    int(atm_data.get("limit", 0)),
+                    float(atm_data.get("pct_saldo", 0)),
+                    float(atm_data.get("skor_urgensi", 0) or 0),
+                    _s(atm_data.get("est_jam")),
+                    atm_data.get("status", "AWAS"),
+                    atm_data.get("denom_options", "100000") or "100000",
+                    datetime.now(),
+                    existing["id"],
+                )
+            )
+        return existing["id"]
+
+    sql = """
+        INSERT INTO notif_cashplan
+            (id_atm, lokasi, wilayah, tipe, denom_options,
+             saldo, `limit`, pct_saldo, skor_urgensi, est_jam,
+             status_awal, status_notif, sumber)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'PENDING', 'system')
+    """
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(sql, (
+            id_atm,
+            atm_data.get("lokasi", "-"),
+            atm_data.get("wilayah", "-"),
+            atm_data.get("tipe", "-"),
+            atm_data.get("denom_options", "100000") or "100000",
+            int(atm_data.get("saldo", 0)),
+            int(atm_data.get("limit", 0)),
+            float(atm_data.get("pct_saldo", 0)),
+            float(atm_data.get("skor_urgensi", 0) or 0),
+            _s(atm_data.get("est_jam")),
+            atm_data.get("status", "AWAS"),
+        ))
+        return cur.lastrowid
+
+
+def get_notif_pending() -> list:
+    """Ambil semua notif PENDING, diurutkan by skor_urgensi DESC."""
+    with get_conn() as conn:
+        cur = conn.cursor(dictionary=True)
+        cur.execute(
+            """SELECT * FROM notif_cashplan
+               WHERE status_notif='PENDING'
+               ORDER BY skor_urgensi DESC""",
+        )
+        rows = cur.fetchall()
+    for r in rows:
+        if r.get("created_at"):  r["created_at"]  = r["created_at"].isoformat()
+        if r.get("decided_at"):  r["decided_at"]  = r["decided_at"].isoformat()
+        r["saldo"] = int(r["saldo"]) if r.get("saldo") is not None else 0
+        r["limit"] = int(r["limit"]) if r.get("limit") is not None else 0
+    return rows
+
+
+def approve_notif(notif_id: int) -> int:
+    """
+    User approve notif → masuk cashplan dengan added_by='notif'.
+    Return cashplan_id.
+    """
+    with get_conn() as conn:
+        cur = conn.cursor(dictionary=True)
+        cur.execute("SELECT * FROM notif_cashplan WHERE id=%s", (notif_id,))
+        item = cur.fetchone()
+
+    if not item:
+        raise ValueError(f"Notif id {notif_id} tidak ditemukan")
+
+    # Masukkan ke cashplan
+    cp_id = add_to_cashplan({
+        "id_atm":       item["id_atm"],
+        "lokasi":       item.get("lokasi", "-"),
+        "wilayah":      item.get("wilayah", "-"),
+        "tipe":         item.get("tipe", "-"),
+        "denom_options": item.get("denom_options", "100000"),
+        "saldo":        item.get("saldo", 0),
+        "limit":        item.get("limit", 0),
+        "pct_saldo":    item.get("pct_saldo", 0),
+        "status":       item.get("status_awal", "AWAS"),
+        "est_jam":      item.get("est_jam"),
+        "skor_urgensi": item.get("skor_urgensi", 0),
+        "added_by":     "notif",
+    })
+
+    # Update status notif
+    with get_conn() as conn:
+        conn.cursor().execute(
+            """UPDATE notif_cashplan
+               SET status_notif='APPROVED', decided_at=%s
+               WHERE id=%s""",
+            (datetime.now(), notif_id)
+        )
+
+    return cp_id
+
+
+def dismiss_notif(notif_id: int):
+    """User dismiss notif → status DISMISSED, tidak masuk cashplan."""
+    with get_conn() as conn:
+        cur = conn.cursor(dictionary=True)
+        cur.execute("SELECT id FROM notif_cashplan WHERE id=%s", (notif_id,))
+        item = cur.fetchone()
+
+    if not item:
+        raise ValueError(f"Notif id {notif_id} tidak ditemukan")
+
+    with get_conn() as conn:
+        conn.cursor().execute(
+            """UPDATE notif_cashplan
+               SET status_notif='DISMISSED', decided_at=%s
+               WHERE id=%s""",
+            (datetime.now(), notif_id)
+        )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  REKAP REPLACEMENT
-# ══════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
 
 def update_rekap_replacement(
     rekap_id: int,
@@ -475,6 +632,10 @@ def update_rekap_replacement(
     jam_cash_out: str = None,
     denom: int = None,
 ) -> dict:
+    """
+    Simpan detail rekap (jam cash in/out, tanggal, denom).
+    Set is_saved=1 → data dikunci, tidak bisa berubah saat re-upload.
+    """
     updates = {"is_saved": 1}
     if tgl_isi      is not None: updates["tgl_isi"]      = tgl_isi
     if jam_cash_in  is not None: updates["jam_cash_in"]  = jam_cash_in
@@ -496,12 +657,16 @@ def get_rekap_replacement(
     tahun: int = None,
     wilayah: str = None,
 ) -> list:
+    """
+    Ambil data rekap. Filter by bulan, tahun, wilayah.
+    Semua data dikembalikan (is_saved=0 maupun =1).
+    """
     where, params = [], []
     if bulan:
         where.append("bulan=%s"); params.append(bulan)
     if tahun:
         where.append("tahun=%s"); params.append(tahun)
-    if wilayah and wilayah != "Semua":
+    if wilayah and wilayah.lower() != "semua":
         where.append("wilayah=%s"); params.append(wilayah)
 
     where_sql = ("WHERE " + " AND ".join(where)) if where else ""
@@ -524,9 +689,49 @@ def get_rekap_replacement(
     return rows
 
 
-# ══════════════════════════════════════════════════════════
+def get_rekap_for_download(wilayah: str = None, bulan: str = None, tahun: int = None) -> list:
+    """
+    Ambil data rekap untuk download Excel/CSV.
+    Hanya ambil kolom yang relevan untuk laporan.
+    """
+    where, params = [], []
+    if wilayah and wilayah.lower() != "semua":
+        where.append("wilayah=%s"); params.append(wilayah)
+    if bulan:
+        where.append("bulan=%s"); params.append(bulan)
+    if tahun:
+        where.append("tahun=%s"); params.append(tahun)
+
+    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+
+    with get_conn() as conn:
+        cur = conn.cursor(dictionary=True)
+        cur.execute(
+            f"""SELECT
+                id_atm, lokasi, wilayah, tipe,
+                denom_options, saldo_awal, `limit`,
+                jumlah_isi, denom, lembar,
+                status_awal, status_done, keterangan,
+                tgl_isi, jam_isi, jam_cash_in, jam_cash_out,
+                done_at, bulan, tahun
+            FROM rekap_replacement {where_sql}
+            ORDER BY done_at DESC""",
+            params
+        )
+        rows = cur.fetchall()
+
+    for r in rows:
+        if r.get("done_at"): r["done_at"] = r["done_at"].isoformat()
+        if r.get("tgl_isi"): r["tgl_isi"] = str(r["tgl_isi"])
+        r["saldo_awal"] = int(r["saldo_awal"]) if r.get("saldo_awal") is not None else 0
+        r["limit"]      = int(r["limit"])       if r.get("limit")      is not None else 0
+        r["jumlah_isi"] = int(r["jumlah_isi"])  if r.get("jumlah_isi") is not None else 0
+    return rows
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  UPLOAD LOG
-# ══════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
 
 def log_upload(
     filename: str,
@@ -538,9 +743,9 @@ def log_upload(
     notes: str = None,
 ):
     sql = """
-    INSERT INTO upload_log
-        (filename, format, total_rows, atm_count, predictions, retrain, notes)
-    VALUES (%s, %s, %s, %s, %s, %s, %s)
+        INSERT INTO upload_log
+            (filename, format, total_rows, atm_count, predictions, retrain, notes)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
     """
     with get_conn() as conn:
         conn.cursor().execute(

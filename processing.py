@@ -485,3 +485,35 @@ def process_dataframe(df: pd.DataFrame) -> pd.DataFrame:
             df[col] = df[col].astype(str)
 
     return df
+
+def clean_denom(value) -> str:
+    """
+    Normalisasi denom dari Excel:
+    50 → "50"
+    100 → "100"
+    100 & 50 → "100,50"
+    """
+    if value is None:
+        return "100"
+
+    try:
+        if pd.isna(value):
+            return "100"
+    except:
+        pass
+
+    s = str(value).lower().strip()
+
+    s = s.replace(" ", "")
+    s = s.replace("&", ",")
+    s = s.replace("/", ",")
+
+    allowed = {"50", "100"}
+    parts = [p for p in s.split(",") if p in allowed]
+
+    if not parts:
+        return "100"
+
+    parts = sorted(parts, reverse=True)  # 100 dulu baru 50
+
+    return ",".join(parts)

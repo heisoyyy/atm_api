@@ -1,16 +1,3 @@
-"""
-main.py — Smart ATM Dashboard API V6.1
-Backend FastAPI + MySQL + XGBoost
-
-Fixes V6.1 vs V6.0:
-  - Upload: handle nullable dtype dari openpyxl/csv dtype_backend
-  - Upload: gunakan engine='openpyxl' tanpa dtype_backend agar kompatibel
-  - _normalize_columns: lebih robust
-  - Error logging lebih informatif
-  - Tambah endpoint /api/health/db untuk cek koneksi MySQL
-  - Tambah endpoint GET /api/atm-list untuk list semua ATM
-"""
-
 import asyncio
 import io
 import math
@@ -22,10 +9,13 @@ from typing import Optional
 import pandas as pd
 from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
-from config import PROCESSED_CSV, PRED_CACHE, MODEL_PATH, FITUR_PATH, WILAYAH_LIST
+from config import (
+    PROCESSED_CSV, PRED_CACHE, MODEL_PATH, FITUR_PATH, WILAYAH_LIST,
+    AUTO_CASHPLAN_PCT, TRIGGER_CASHPLAN_PCT,
+)
 from processing import process_dataframe
 from predictor import build_predictions, save_cache, load_cache
 from trainer import train
@@ -39,12 +29,16 @@ from database import (
     update_cashplan_status,
     remove_cashplan_only,
     get_rekap_replacement,
-    log_upload,
+    get_rekap_for_download,
     update_rekap_replacement,
+    log_upload,
+    # notif
+    upsert_notif_cashplan,
+    get_notif_pending,
+    approve_notif,
+    dismiss_notif,
 )
 
-
-# ── Sanitize helper ───────────────────────────────────────────────────────────
 
 def _sanitize(obj):
     """Rekursif ganti NaN/Inf → None agar JSON-safe."""
@@ -63,8 +57,8 @@ def _sanitize(obj):
 
 app = FastAPI(
     title="Smart ATM Dashboard API",
-    description="Backend monitoring & prediksi saldo ATM BRK Syariah — V6.1 + MySQL",
-    version="6.1.0",
+    description="Backend monitoring & prediksi saldo ATM BRK Syariah — V7",
+    version="7.0.0",
 )
 
 app.add_middleware(
@@ -75,7 +69,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Training state (in-memory) ────────────────────────────────────────────────
 _train_state = {
     "status":       "idle",
     "progress":     0,
@@ -93,17 +86,21 @@ _train_state = {
 def root():
     return {
         "service":    "Smart ATM Dashboard API",
-        "version":    "6.1.0",
+        "version":    "7.0.0",
         "status":     "running",
         "time":       datetime.now().isoformat(),
         "storage":    "MySQL + JSON Cache",
-        "thresholds": {"aman": "> 30%", "awas": "20–30%", "bongkar": "≤ 20%"},
+        "thresholds": {
+            "aman":        "> 35%",
+            "perlu_pantau": "30–35%",
+            "awas":        "20–30%",
+            "bongkar":     "≤ 20%",
+        },
     }
 
 
 @app.get("/api/health/db", tags=["Health"])
 def health_db():
-    """Cek koneksi MySQL."""
     try:
         from database import get_conn
         with get_conn() as conn:
@@ -131,11 +128,10 @@ def get_status():
         "model_path":   str(MODEL_PATH) if has_model else None,
         "train_status": _train_state["status"],
         "last_trained": _train_state["last_trained"],
-        "version":      "6.1.0",
+        "version":      "7.0.0",
         "config": {
-            "STATUS_AMAN_PCT":    0.30,
-            "STATUS_AWAS_PCT":    0.20,
-            "STATUS_BONGKAR_PCT": 0.20,
+            "AUTO_CASHPLAN_PCT":    AUTO_CASHPLAN_PCT,
+            "TRIGGER_CASHPLAN_PCT": TRIGGER_CASHPLAN_PCT,
         },
     }
 
@@ -153,20 +149,17 @@ def get_status():
         except Exception as e:
             info["data_error"] = str(e)
 
-    # Fallback ke MySQL
     if not has_data or not has_model or not has_cache:
         try:
             from database import get_conn
             with get_conn() as conn:
                 cur = conn.cursor(dictionary=True)
-
                 cur.execute("SELECT COUNT(*) AS cnt FROM predictions")
                 pred_count = cur.fetchone()["cnt"]
 
                 if pred_count > 0:
                     info["has_data"]  = True
                     info["has_cache"] = True
-
                     cur.execute("""
                         SELECT COUNT(*) AS total_atm, MAX(generated_at) AS generated_at
                         FROM predictions
@@ -181,11 +174,9 @@ def get_status():
 
                 cur.execute("SELECT COUNT(*) AS cnt FROM atm_history")
                 hist_count = cur.fetchone()["cnt"]
-
                 if hist_count > 0:
                     info["has_data"]   = True
                     info["total_rows"] = int(hist_count)
-
                     cur.execute("""
                         SELECT MIN(DATE(recorded_at)) AS date_from, MAX(DATE(recorded_at)) AS date_to
                         FROM atm_history
@@ -195,6 +186,11 @@ def get_status():
                         "from": str(date_row["date_from"]) if date_row["date_from"] else "-",
                         "to":   str(date_row["date_to"])   if date_row["date_to"]   else "-",
                     }
+
+                # Jumlah notif pending
+                cur.execute("SELECT COUNT(*) AS cnt FROM notif_cashplan WHERE status_notif='PENDING'")
+                info["notif_pending"] = cur.fetchone()["cnt"]
+
         except Exception as e:
             info["db_error"] = str(e)
 
@@ -253,12 +249,10 @@ def _extract_jam(basename: str) -> Optional[str]:
 
 
 def _read_tabular(zf: zipfile.ZipFile, name: str) -> pd.DataFrame:
-    """Baca file CSV/XLSX dari dalam ZIP. Tidak menggunakan dtype_backend agar aman."""
     lower = name.lower()
     with zf.open(name) as raw:
         data = raw.read()
     buf = io.BytesIO(data)
-
     if lower.endswith(".csv"):
         for enc in ("utf-8", "utf-8-sig", "latin-1", "cp1252"):
             try:
@@ -268,21 +262,16 @@ def _read_tabular(zf: zipfile.ZipFile, name: str) -> pd.DataFrame:
                 continue
         buf.seek(0)
         return pd.read_csv(buf, encoding="latin-1", errors="replace")
-
     elif lower.endswith(".xlsx"):
         return pd.read_excel(buf, engine="openpyxl")
-
     elif lower.endswith(".xls"):
         return pd.read_excel(buf, engine="xlrd")
-
     raise ValueError(f"Format tidak didukung: {name}")
 
 
 def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Normalize nama kolom agar konsisten."""
     df = df.copy()
     df.columns = [str(c).strip() for c in df.columns]
-
     col_rename = {}
     for col in df.columns:
         c = col.lower().strip()
@@ -306,18 +295,14 @@ def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
             col_rename[col] = 'Tanggal'
         elif c in ('jam', 'time', 'waktu'):
             col_rename[col] = 'Jam'
-
+        elif c == 'denom':
+            col_rename[col] = 'Denom'   # pastikan kolom Denom terbawa
     return df.rename(columns=col_rename)
 
 
 def _read_excel_or_csv(content: bytes, filename: str) -> pd.DataFrame:
-    """
-    Baca file Excel/CSV dari bytes.
-    TIDAK pakai dtype_backend='numpy_nullable' agar tidak ada nullable dtype issues.
-    """
     buf = io.BytesIO(content)
     fname = filename.lower()
-
     if fname.endswith('.csv'):
         for enc in ('utf-8', 'utf-8-sig', 'latin-1', 'cp1252'):
             try:
@@ -327,56 +312,44 @@ def _read_excel_or_csv(content: bytes, filename: str) -> pd.DataFrame:
                 continue
         buf.seek(0)
         return pd.read_csv(buf, encoding='latin-1', errors='replace')
-
     elif fname.endswith('.xlsx') or fname.endswith('.xlsm'):
         buf.seek(0)
         return pd.read_excel(buf, engine='openpyxl')
-
     elif fname.endswith('.xls'):
         buf.seek(0)
         return pd.read_excel(buf, engine='xlrd')
-
     raise HTTPException(400, f"Format file tidak didukung: {filename}")
 
 
 def _parse_zip(zip_bytes: bytes):
-    """Parse ZIP berisi file monitoring ATM harian."""
     SUPPORTED = {".csv", ".xlsx", ".xls"}
     frames, errors = [], []
-
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
         for name in zf.namelist():
-            # Skip direktori dan hidden files
             if name.endswith("/") or "/." in name or name.startswith(".__"):
                 continue
             ext = ("." + name.rsplit(".", 1)[-1].lower()) if "." in name else ""
             if ext not in SUPPORTED:
                 continue
-
             tanggal_str = _extract_tanggal(name)
             if not tanggal_str:
                 errors.append(f"Skip (tanggal tidak terdeteksi): {name}")
                 continue
-
             basename = name.split("/")[-1]
             jam_str  = _extract_jam(basename)
             if not jam_str:
                 errors.append(f"Skip (jam tidak terdeteksi): {name}")
                 continue
-
             try:
                 df_file = _read_tabular(zf, name)
             except Exception as e:
                 errors.append(f"Gagal baca {name}: {e}")
                 continue
-
             df_file = _normalize_columns(df_file)
-
             missing = {"ID ATM", "Sisa Saldo", "Limit"} - set(df_file.columns)
             if missing:
                 errors.append(f"Skip (kolom {missing} tidak ditemukan): {name}")
                 continue
-
             df_file["Tanggal"] = tanggal_str
             df_file["Jam"]     = jam_str
             frames.append(df_file)
@@ -391,7 +364,7 @@ def _parse_zip(zip_bytes: bytes):
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-#  UPLOAD — dengan MySQL sync
+#  UPLOAD
 # ════════════════════════════════════════════════════════════════════════════════
 
 @app.post("/api/upload", tags=["Data"])
@@ -400,22 +373,13 @@ async def upload_data(
     file: UploadFile = File(...),
     retrain: bool = Query(True),
 ):
-    """
-    Upload data monitoring ATM.
-    Format yang didukung:
-    - ZIP (berisi file XLSX/CSV harian, nama file mengandung tanggal & jam)
-    - XLSX / XLS (file monitoring single snapshot)
-    - CSV (processed atau raw)
-    """
     fname   = file.filename or ""
     content = await file.read()
     parse_warnings = []
 
-    # ── 1. Parse berdasarkan format ──────────────────────────────────────────
     if fname.lower().endswith(".zip"):
         df_new, parse_warnings = _parse_zip(content)
         is_processed = False
-
     elif fname.lower().endswith((".xlsx", ".xls", ".xlsm")):
         df_new = _read_excel_or_csv(content, fname)
         df_new = _normalize_columns(df_new)
@@ -425,7 +389,6 @@ async def upload_data(
         if "Jam" not in df_new.columns:
             df_new["Jam"] = _now.strftime("%H:00")
         is_processed = "Avg Penarikan 6j" in df_new.columns
-
     elif fname.lower().endswith(".csv"):
         df_new = _read_excel_or_csv(content, fname)
         df_new = _normalize_columns(df_new)
@@ -435,60 +398,42 @@ async def upload_data(
         if "Jam" not in df_new.columns:
             df_new["Jam"] = _now.strftime("%H:00")
         is_processed = "Avg Penarikan 6j" in df_new.columns
-
     else:
         raise HTTPException(400, f"Format tidak didukung: {fname}. Gunakan ZIP, XLSX, atau CSV.")
 
-    # Validasi minimal
     if df_new.empty:
         raise HTTPException(400, "File kosong atau tidak ada data yang bisa dibaca.")
 
     for col in ["ID ATM", "Sisa Saldo", "Limit"]:
         if col not in df_new.columns:
-            raise HTTPException(
-                400,
-                f"Kolom wajib '{col}' tidak ditemukan. "
-                f"Kolom yang ada: {list(df_new.columns)}"
-            )
-
-    # ── 2. Merge incremental ─────────────────────────────────────────────────
+            raise HTTPException(400, f"Kolom wajib '{col}' tidak ditemukan. Kolom yang ada: {list(df_new.columns)}")
 
     try:
         if PROCESSED_CSV.exists():
             df_old = pd.read_csv(PROCESSED_CSV, low_memory=False)
             is_old_processed = "Avg Penarikan 6j" in df_old.columns
-
             df_old["ID ATM"] = df_old["ID ATM"].astype(str).str.strip().str.upper()
             df_new["ID ATM"] = df_new["ID ATM"].astype(str).str.strip().str.upper()
 
             if is_processed and is_old_processed:
-                # Keduanya sudah processed — merge langsung, skip re-process
                 df_merged = pd.concat([df_old, df_new], ignore_index=True)
                 if "datetime" in df_merged.columns:
                     df_merged["datetime"] = pd.to_datetime(df_merged["datetime"])
                     df_merged = df_merged.drop_duplicates(subset=["ID ATM", "datetime"])
                 df_final = df_merged
-
             elif not is_processed and is_old_processed:
-                # ZIP baru (raw) masuk, df_old sudah processed
-                # Ambil kolom raw dari df_old, gabung dengan df_new, process ulang semua
                 tanggal_baru = set(df_new["Tanggal"].astype(str).str[:10].unique())
-
                 raw_cols = ["ID ATM", "Sisa Saldo", "Limit", "Tanggal", "Jam",
-                            "Merk ATM", "Lokasi ATM", "Alamat ATM", "Vendor"]
+                            "Merk ATM", "Lokasi ATM", "Alamat ATM", "Vendor", "Denom"]
                 raw_cols_available = [c for c in raw_cols if c in df_old.columns]
-
                 df_old_raw = df_old[raw_cols_available].copy()
                 df_old_raw = df_old_raw[
                     ~df_old_raw["Tanggal"].astype(str).str[:10].isin(tanggal_baru)
                 ]
-
                 df_combined = pd.concat([df_old_raw, df_new], ignore_index=True)
                 df_combined = df_combined.drop_duplicates(subset=["ID ATM", "Tanggal", "Jam"])
                 df_final = process_dataframe(df_combined)
-
             else:
-                # df_old belum processed — gabung raw dan process semua
                 tanggal_baru = set(df_new["Tanggal"].astype(str).str[:10].unique())
                 df_old = df_old[
                     ~df_old["Tanggal"].astype(str).str[:10].isin(tanggal_baru)
@@ -496,7 +441,6 @@ async def upload_data(
                 df_combined = pd.concat([df_old, df_new], ignore_index=True)
                 df_combined = df_combined.drop_duplicates(subset=["ID ATM", "Tanggal", "Jam"])
                 df_final = process_dataframe(df_combined)
-
         else:
             df_final = df_new if is_processed else process_dataframe(df_new)
 
@@ -505,13 +449,11 @@ async def upload_data(
     except Exception as e:
         raise HTTPException(500, f"Gagal memproses data: {str(e)}")
 
-    # ── 3. Simpan CSV processed ──────────────────────────────────────────────
     try:
         df_final.to_csv(PROCESSED_CSV, index=False)
     except Exception as e:
         raise HTTPException(500, f"Gagal menyimpan CSV: {str(e)}")
 
-    # ── 4. Build predictions ─────────────────────────────────────────────────
     def _clean_pred(p):
         return {
             k: (None if isinstance(v, float) and (math.isnan(v) or math.isinf(v)) else v)
@@ -525,17 +467,20 @@ async def upload_data(
         parse_warnings.append(f"[Prediction Warning] {str(e)}")
         predictions = []
 
-    # ── 5. Sync ke MySQL ─────────────────────────────────────────────────────
     db_synced = False
     try:
         if predictions:
             upsert_predictions(predictions)
         bulk_insert_history(df_final)
         db_synced = True
+
+        # Sync notif_cashplan dari prediksi terbaru
+        # ATM yang masuk zona trigger (pct <= TRIGGER_CASHPLAN_PCT) dimasukkan ke notif
+        _sync_notif_from_predictions(predictions)
+
     except Exception as e:
         parse_warnings.append(f"[DB Warning] {str(e)}")
 
-    # ── 6. Log upload ────────────────────────────────────────────────────────
     try:
         log_upload(
             fname,
@@ -549,14 +494,14 @@ async def upload_data(
         parse_warnings.append(f"[Log Warning] {str(e)}")
 
     resp = {
-        "message":     "Upload berhasil",
-        "version":     "V6.1",
-        "format":      "ZIP" if fname.lower().endswith(".zip") else "Excel/CSV",
+        "message":      "Upload berhasil",
+        "version":      "V7",
+        "format":       "ZIP" if fname.lower().endswith(".zip") else "Excel/CSV",
         "is_processed": is_processed,
-        "rows":        len(df_final),
-        "atm_count":   int(df_final["ID ATM"].nunique()) if "ID ATM" in df_final.columns else 0,
-        "predictions": len(predictions),
-        "db_synced":   db_synced,
+        "rows":         len(df_final),
+        "atm_count":    int(df_final["ID ATM"].nunique()) if "ID ATM" in df_final.columns else 0,
+        "predictions":  len(predictions),
+        "db_synced":    db_synced,
     }
     if parse_warnings:
         resp["warnings"] = parse_warnings[:15]
@@ -566,6 +511,43 @@ async def upload_data(
         resp["retrain"] = "Dimulai di background — cek GET /api/train/status"
 
     return resp
+
+
+def _sync_notif_from_predictions(predictions: list):
+    """
+    Setelah upload, ATM dengan pct_saldo <= TRIGGER_CASHPLAN_PCT dimasukkan ke notif.
+    ATM dengan pct_saldo <= AUTO_CASHPLAN_PCT langsung masuk cashplan (system).
+    ATM yang sudah ada di cashplan PENDING tidak dimasukkan lagi.
+    """
+    from database import get_conn
+
+    # Ambil semua ATM yang sudah PENDING di cashplan
+    with get_conn() as conn:
+        cur = conn.cursor(dictionary=True)
+        cur.execute("SELECT id_atm FROM cashplan WHERE status_cashplan='PENDING'")
+        pending_ids = {r["id_atm"] for r in cur.fetchall()}
+
+    for p in predictions:
+        atm_id  = p.get("id_atm", "")
+        pct     = float(p.get("pct_saldo", 100) or 100)
+        status  = p.get("status", "")
+
+        if atm_id in pending_ids:
+            continue  # sudah ada di cashplan, skip
+
+        if pct <= AUTO_CASHPLAN_PCT * 100:
+            # Auto masuk cashplan
+            try:
+                add_to_cashplan({**p, "added_by": "system"})
+            except Exception:
+                pass
+
+        elif pct <= TRIGGER_CASHPLAN_PCT * 100:
+            # Masuk notif untuk diputuskan user
+            try:
+                upsert_notif_cashplan(p)
+            except Exception:
+                pass
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -580,7 +562,7 @@ async def trigger_train(background_tasks: BackgroundTasks):
         raise HTTPException(404, "Belum ada data. Upload terlebih dahulu.")
     df = pd.read_csv(PROCESSED_CSV, low_memory=False)
     background_tasks.add_task(_do_retrain, df)
-    return {"message": "Training V6 dimulai", "monitor": "GET /api/train/status"}
+    return {"message": "Training V7 dimulai", "monitor": "GET /api/train/status"}
 
 
 @app.get("/api/train/status", tags=["Training"])
@@ -589,7 +571,7 @@ def get_train_status():
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-#  PREDICTIONS — baca dari MySQL, fallback ke JSON cache
+#  PREDICTIONS
 # ════════════════════════════════════════════════════════════════════════════════
 
 @app.get("/api/predictions", tags=["Predictions"])
@@ -600,21 +582,11 @@ def get_predictions(
     limit:   int = Query(100, ge=1, le=500),
     offset:  int = Query(0, ge=0),
 ):
-    """Ambil daftar prediksi ATM. Filter by wilayah, status, tipe."""
     try:
-        result = get_predictions_from_db(
-            wilayah=wilayah, status=status, tipe=tipe,
-            limit=limit, offset=offset
-        )
-        return _sanitize({
-            "generated_at": result["generated_at"],
-            "total":        result["total"],
-            "offset":       offset,
-            "limit":        limit,
-            "data":         result["data"],
-        })
+        result = get_predictions_from_db(wilayah=wilayah, status=status, tipe=tipe, limit=limit, offset=offset)
+        return _sanitize({"generated_at": result["generated_at"], "total": result["total"],
+                          "offset": offset, "limit": limit, "data": result["data"]})
     except Exception:
-        # Fallback ke JSON cache
         cache = load_cache()
         if cache is None:
             raise HTTPException(404, "Belum ada prediksi. Upload data terlebih dahulu.")
@@ -622,18 +594,12 @@ def get_predictions(
         if wilayah: data = [d for d in data if wilayah.lower() in d.get("wilayah", "").lower()]
         if status:  data = [d for d in data if d.get("status", "").lower() == status.lower()]
         if tipe:    data = [d for d in data if d.get("tipe", "").upper() == tipe.upper()]
-        return _sanitize({
-            "generated_at": cache.get("generated_at"),
-            "total":        len(data),
-            "offset":       offset,
-            "limit":        limit,
-            "data":         data[offset: offset + limit],
-        })
+        return _sanitize({"generated_at": cache.get("generated_at"), "total": len(data),
+                          "offset": offset, "limit": limit, "data": data[offset: offset + limit]})
 
 
 @app.get("/api/predictions/{atm_id}", tags=["Predictions"])
 def get_prediction_detail(atm_id: str):
-    """Detail prediksi untuk 1 ATM."""
     try:
         from database import get_conn
         with get_conn() as conn:
@@ -643,14 +609,12 @@ def get_prediction_detail(atm_id: str):
         if not row:
             raise HTTPException(404, f"ATM {atm_id} tidak ditemukan di database.")
         for f in ["generated_at", "last_update", "tgl_awas", "tgl_habis", "tgl_isi"]:
-            if row.get(f):
-                row[f] = str(row[f])
+            if row.get(f): row[f] = str(row[f])
         row["atm_sepi"] = bool(row.get("atm_sepi", 0))
         return _sanitize(row)
     except HTTPException:
         raise
     except Exception:
-        # Fallback ke cache
         cache = load_cache()
         if cache is None:
             raise HTTPException(404, "Belum ada prediksi.")
@@ -661,19 +625,17 @@ def get_prediction_detail(atm_id: str):
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-#  ALERTS
+#  ALERTS & SUMMARY
 # ════════════════════════════════════════════════════════════════════════════════
 
 @app.get("/api/alerts", tags=["Alerts"])
-def get_alerts(level: Optional[str] = Query(None, description="BONGKAR atau AWAS")):
-    """ATM dengan status kritis (BONGKAR / AWAS), diurutkan berdasarkan urgensi."""
+def get_alerts(level: Optional[str] = Query(None)):
     alert_statuses = ["BONGKAR", "AWAS"]
     if level:
         lvl = level.upper()
         if lvl not in alert_statuses:
             raise HTTPException(400, f"Level harus BONGKAR atau AWAS, bukan '{level}'")
         alert_statuses = [lvl]
-
     try:
         results = []
         for st in alert_statuses:
@@ -681,70 +643,44 @@ def get_alerts(level: Optional[str] = Query(None, description="BONGKAR atau AWAS
             results.extend(r["data"])
         results.sort(key=lambda x: x.get("skor_urgensi", 0) or 0, reverse=True)
         gen_at = results[0].get("generated_at") if results else None
-        return _sanitize({
-            "generated_at": gen_at,
-            "total_alerts": len(results),
-            "breakdown":    {s: sum(1 for d in results if d["status"] == s) for s in alert_statuses},
-            "data":         results,
-        })
+        return _sanitize({"generated_at": gen_at, "total_alerts": len(results),
+                          "breakdown": {s: sum(1 for d in results if d["status"] == s) for s in alert_statuses},
+                          "data": results})
     except Exception:
         cache = load_cache()
         if cache is None:
             raise HTTPException(404, "Belum ada prediksi.")
         alerts = [d for d in cache["data"] if d.get("status") in alert_statuses]
         alerts.sort(key=lambda x: x.get("skor_urgensi", 0) or 0, reverse=True)
-        return _sanitize({
-            "generated_at": cache.get("generated_at"),
-            "total_alerts": len(alerts),
-            "breakdown":    {s: sum(1 for d in alerts if d.get("status") == s) for s in alert_statuses},
-            "data":         alerts,
-        })
+        return _sanitize({"generated_at": cache.get("generated_at"), "total_alerts": len(alerts),
+                          "breakdown": {s: sum(1 for d in alerts if d.get("status") == s) for s in alert_statuses},
+                          "data": alerts})
 
-
-# ════════════════════════════════════════════════════════════════════════════════
-#  SUMMARY
-# ════════════════════════════════════════════════════════════════════════════════
 
 @app.get("/api/summary", tags=["Summary"])
 def get_summary():
-    """Ringkasan status semua ATM, dipecah per wilayah."""
     try:
         from database import get_conn
         with get_conn() as conn:
             cur = conn.cursor(dictionary=True)
             cur.execute("""
-                SELECT
-                    COUNT(*)                            AS total_atm,
-                    SUM(status='BONGKAR')               AS bongkar,
-                    SUM(status='AWAS')                  AS awas,
-                    SUM(status='PERLU PANTAU')          AS perlu_pantau,
-                    SUM(status='AMAN')                  AS aman,
-                    SUM(status='OVERFUND')              AS overfund,
-                    SUM(atm_sepi=1)                     AS atm_sepi,
-                    ROUND(AVG(pct_saldo), 1)            AS avg_pct_saldo,
-                    MAX(generated_at)                   AS generated_at
+                SELECT COUNT(*) AS total_atm,
+                    SUM(status='BONGKAR') AS bongkar, SUM(status='AWAS') AS awas,
+                    SUM(status='PERLU PANTAU') AS perlu_pantau, SUM(status='AMAN') AS aman,
+                    SUM(status='OVERFUND') AS overfund, SUM(atm_sepi=1) AS atm_sepi,
+                    ROUND(AVG(pct_saldo),1) AS avg_pct_saldo, MAX(generated_at) AS generated_at
                 FROM predictions
             """)
             ov_row = cur.fetchone()
-
             cur.execute("""
-                SELECT
-                    wilayah,
-                    COUNT(*)                   AS total,
-                    SUM(status='BONGKAR')      AS bongkar,
-                    SUM(status='AWAS')         AS awas,
-                    SUM(status='PERLU PANTAU') AS perlu_pantau,
-                    SUM(status='AMAN')         AS aman,
-                    SUM(status='OVERFUND')     AS overfund,
-                    SUM(atm_sepi=1)            AS atm_sepi,
-                    ROUND(AVG(pct_saldo), 1)   AS avg_pct_saldo,
-                    ROUND(AVG(skor_urgensi),1) AS avg_skor
-                FROM predictions
-                GROUP BY wilayah
-                ORDER BY AVG(skor_urgensi) DESC
+                SELECT wilayah, COUNT(*) AS total,
+                    SUM(status='BONGKAR') AS bongkar, SUM(status='AWAS') AS awas,
+                    SUM(status='PERLU PANTAU') AS perlu_pantau, SUM(status='AMAN') AS aman,
+                    SUM(status='OVERFUND') AS overfund, SUM(atm_sepi=1) AS atm_sepi,
+                    ROUND(AVG(pct_saldo),1) AS avg_pct_saldo, ROUND(AVG(skor_urgensi),1) AS avg_skor
+                FROM predictions GROUP BY wilayah ORDER BY AVG(skor_urgensi) DESC
             """)
             wilayah_rows = cur.fetchall()
-
             cur.execute("SELECT status, COUNT(*) AS cnt FROM predictions GROUP BY status")
             status_breakdown = {r["status"]: r["cnt"] for r in cur.fetchall()}
 
@@ -763,59 +699,39 @@ def get_summary():
             "status_breakdown": status_breakdown,
             "kritis":         _i(ov_row["bongkar"]),
         }
-        gen_at = (
-            ov_row["generated_at"].isoformat()
-            if ov_row.get("generated_at") else None
-        )
-
-        per_wilayah = [
-            {
-                "wilayah":       w["wilayah"],
-                "total":         _i(w["total"]),
-                "bongkar":       _i(w["bongkar"]),
-                "awas":          _i(w["awas"]),
-                "perlu_pantau":  _i(w["perlu_pantau"]),
-                "aman":          _i(w["aman"]),
-                "overfund":      _i(w["overfund"]),
-                "atm_sepi":      _i(w["atm_sepi"]),
-                "avg_pct_saldo": _f(w["avg_pct_saldo"]),
-                "avg_skor":      _f(w["avg_skor"]),
-            }
-            for w in wilayah_rows
-        ]
+        gen_at = ov_row["generated_at"].isoformat() if ov_row.get("generated_at") else None
+        per_wilayah = [{
+            "wilayah": w["wilayah"], "total": _i(w["total"]),
+            "bongkar": _i(w["bongkar"]), "awas": _i(w["awas"]),
+            "perlu_pantau": _i(w["perlu_pantau"]), "aman": _i(w["aman"]),
+            "overfund": _i(w["overfund"]), "atm_sepi": _i(w["atm_sepi"]),
+            "avg_pct_saldo": _f(w["avg_pct_saldo"]), "avg_skor": _f(w["avg_skor"]),
+        } for w in wilayah_rows]
 
         return _sanitize({"generated_at": gen_at, "overall": overall, "per_wilayah": per_wilayah})
 
     except Exception:
-        # Fallback ke cache
         cache = load_cache()
         if cache is None:
             raise HTTPException(404, "Belum ada prediksi.")
         data = cache["data"]
-
         def _n(v, default=0.0):
             if v is None: return default
             try:
                 f = float(v)
                 return default if (math.isnan(f) or math.isinf(f)) else f
             except: return default
-
         status_counts = {}
         for d in data:
             status_counts[d.get("status", "NO DATA")] = status_counts.get(d.get("status", "NO DATA"), 0) + 1
-
         pct_values = [_n(d.get("pct_saldo")) for d in data]
         overall = {
-            "total_atm":      len(data),
-            "bongkar":        status_counts.get("BONGKAR", 0),
-            "awas":           status_counts.get("AWAS", 0),
-            "perlu_pantau":   status_counts.get("PERLU PANTAU", 0),
-            "aman":           status_counts.get("AMAN", 0),
-            "overfund":       status_counts.get("OVERFUND", 0),
-            "atm_sepi":       sum(1 for d in data if d.get("atm_sepi")),
-            "avg_pct_saldo":  round(sum(pct_values) / max(len(pct_values), 1), 1),
-            "status_breakdown": status_counts,
-            "kritis":         status_counts.get("BONGKAR", 0),
+            "total_atm": len(data), "bongkar": status_counts.get("BONGKAR", 0),
+            "awas": status_counts.get("AWAS", 0), "perlu_pantau": status_counts.get("PERLU PANTAU", 0),
+            "aman": status_counts.get("AMAN", 0), "overfund": status_counts.get("OVERFUND", 0),
+            "atm_sepi": sum(1 for d in data if d.get("atm_sepi")),
+            "avg_pct_saldo": round(sum(pct_values) / max(len(pct_values), 1), 1),
+            "status_breakdown": status_counts, "kritis": status_counts.get("BONGKAR", 0),
         }
         wilayah_map = {}
         for d in data:
@@ -823,31 +739,23 @@ def get_summary():
         per_wilayah = []
         for w, items in wilayah_map.items():
             pcts = [_n(i.get("pct_saldo")) for i in items]
-            per_wilayah.append({
-                "wilayah":       w,
-                "total":         len(items),
-                "bongkar":       sum(1 for i in items if i.get("status") == "BONGKAR"),
-                "awas":          sum(1 for i in items if i.get("status") == "AWAS"),
-                "perlu_pantau":  sum(1 for i in items if i.get("status") == "PERLU PANTAU"),
-                "aman":          sum(1 for i in items if i.get("status") == "AMAN"),
-                "overfund":      sum(1 for i in items if i.get("status") == "OVERFUND"),
-                "atm_sepi":      sum(1 for i in items if i.get("atm_sepi")),
-                "avg_pct_saldo": round(sum(pcts) / max(len(pcts), 1), 1),
-            })
-        return _sanitize({
-            "generated_at": cache.get("generated_at"),
-            "overall": overall,
-            "per_wilayah": per_wilayah,
-        })
+            per_wilayah.append({"wilayah": w, "total": len(items),
+                "bongkar": sum(1 for i in items if i.get("status") == "BONGKAR"),
+                "awas": sum(1 for i in items if i.get("status") == "AWAS"),
+                "perlu_pantau": sum(1 for i in items if i.get("status") == "PERLU PANTAU"),
+                "aman": sum(1 for i in items if i.get("status") == "AMAN"),
+                "overfund": sum(1 for i in items if i.get("status") == "OVERFUND"),
+                "atm_sepi": sum(1 for i in items if i.get("atm_sepi")),
+                "avg_pct_saldo": round(sum(pcts) / max(len(pcts), 1), 1)})
+        return _sanitize({"generated_at": cache.get("generated_at"), "overall": overall, "per_wilayah": per_wilayah})
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-#  HISTORY
+#  HISTORY / ATM LIST / WILAYAH
 # ════════════════════════════════════════════════════════════════════════════════
 
 @app.get("/api/history/{atm_id}", tags=["History"])
 def get_atm_history(atm_id: str, last_n_days: int = Query(7, ge=1, le=30)):
-    """Historis saldo ATM dalam N hari terakhir."""
     try:
         result = get_atm_history_from_db(atm_id.strip().upper(), last_n_days)
         if result is None:
@@ -856,62 +764,22 @@ def get_atm_history(atm_id: str, last_n_days: int = Query(7, ge=1, le=30)):
     except HTTPException:
         raise
     except Exception:
-        if not PROCESSED_CSV.exists():
-            raise HTTPException(404, "Belum ada data.")
-        df = pd.read_csv(PROCESSED_CSV, low_memory=False)
-        atm_id_upper = atm_id.strip().upper()
-        df["ID ATM"] = df["ID ATM"].astype(str).str.strip().str.upper()
-        atm_df = df[df["ID ATM"] == atm_id_upper].copy()
-        if atm_df.empty:
-            raise HTTPException(404, f"ATM {atm_id} tidak ditemukan.")
-        atm_df["datetime"] = pd.to_datetime(atm_df["datetime"])
-        cutoff = atm_df["datetime"].max() - pd.Timedelta(days=last_n_days)
-        atm_df = atm_df[atm_df["datetime"] >= cutoff].sort_values("datetime")
-        cols = ["datetime", "Sisa Saldo", "Limit", "Penarikan", "Persentase",
-                "Is Refill", "Is_Interpolated", "Status"]
-        cols = [c for c in cols if c in atm_df.columns]
-        records = atm_df[cols].rename(columns={
-            "Sisa Saldo": "saldo", "Limit": "limit", "Penarikan": "penarikan",
-            "Persentase": "pct", "Is Refill": "is_refill",
-            "Is_Interpolated": "is_interpolated", "Status": "status",
-        }).to_dict(orient="records")
-        return _sanitize({
-            "id_atm":       atm_id_upper,
-            "last_n_days":  last_n_days,
-            "total_rows":   len(records),
-            "refill_count": int(atm_df.get("Is Refill", pd.Series([0])).sum()),
-            "saldo_min":    float(atm_df["Sisa Saldo"].min()),
-            "saldo_max":    float(atm_df["Sisa Saldo"].max()),
-            "saldo_latest": float(atm_df["Sisa Saldo"].iloc[-1]),
-            "limit":        float(atm_df["Limit"].iloc[-1]),
-            "data":         records,
-        })
+        raise HTTPException(500, "Gagal mengambil history ATM.")
 
-
-# ════════════════════════════════════════════════════════════════════════════════
-#  ATM LIST
-# ════════════════════════════════════════════════════════════════════════════════
 
 @app.get("/api/atm-list", tags=["ATM"])
 def get_atm_list(wilayah: Optional[str] = Query(None), status: Optional[str] = Query(None)):
-    """List semua ID ATM dengan info dasar."""
     try:
         from database import get_conn
         where, params = [], []
-        if wilayah:
-            where.append("wilayah LIKE %s")
-            params.append(f"%{wilayah}%")
-        if status:
-            where.append("LOWER(status) = %s")
-            params.append(status.lower())
+        if wilayah: where.append("wilayah LIKE %s"); params.append(f"%{wilayah}%")
+        if status:  where.append("LOWER(status) = %s"); params.append(status.lower())
         where_sql = ("WHERE " + " AND ".join(where)) if where else ""
         with get_conn() as conn:
             cur = conn.cursor(dictionary=True)
             cur.execute(
-                f"SELECT id_atm, lokasi, wilayah, tipe, pct_saldo, status, skor_urgensi "
-                f"FROM predictions {where_sql} ORDER BY skor_urgensi DESC",
-                params,
-            )
+                f"SELECT id_atm, lokasi, wilayah, tipe, denom_options, pct_saldo, status, skor_urgensi "
+                f"FROM predictions {where_sql} ORDER BY skor_urgensi DESC", params)
             rows = cur.fetchall()
         return {"total": len(rows), "data": rows}
     except Exception:
@@ -921,35 +789,21 @@ def get_atm_list(wilayah: Optional[str] = Query(None), status: Optional[str] = Q
         data = cache["data"]
         if wilayah: data = [d for d in data if wilayah.lower() in d.get("wilayah", "").lower()]
         if status:  data = [d for d in data if d.get("status", "").lower() == status.lower()]
-        return {"total": len(data), "data": [
-            {k: d[k] for k in ["id_atm", "lokasi", "wilayah", "tipe", "pct_saldo", "status", "skor_urgensi"] if k in d}
-            for d in data
-        ]}
+        return {"total": len(data), "data": [{k: d[k] for k in ["id_atm","lokasi","wilayah","tipe","denom_options","pct_saldo","status","skor_urgensi"] if k in d} for d in data]}
 
-
-# ════════════════════════════════════════════════════════════════════════════════
-#  WILAYAH
-# ════════════════════════════════════════════════════════════════════════════════
 
 @app.get("/api/wilayah", tags=["Wilayah"])
 def get_wilayah():
-    """Daftar ATM dikelompokkan per wilayah."""
     try:
         from database import get_conn
         with get_conn() as conn:
             cur = conn.cursor(dictionary=True)
-            cur.execute("""
-                SELECT id_atm, lokasi, tipe, pct_saldo, status, skor_urgensi, atm_sepi, wilayah
-                FROM predictions ORDER BY skor_urgensi DESC
-            """)
+            cur.execute("SELECT id_atm,lokasi,tipe,denom_options,pct_saldo,status,skor_urgensi,atm_sepi,wilayah FROM predictions ORDER BY skor_urgensi DESC")
             rows = cur.fetchall()
-
         result = {}
         for d in rows:
-            w = d["wilayah"]
             d["atm_sepi"] = bool(d.get("atm_sepi", 0))
-            result.setdefault(w, []).append(d)
-
+            result.setdefault(d["wilayah"], []).append(d)
         return _sanitize({"wilayah_list": list(result.keys()), "data": result})
     except Exception:
         cache = load_cache()
@@ -958,12 +812,7 @@ def get_wilayah():
         result = {}
         for d in cache["data"]:
             w = d.get("wilayah", "Unknown")
-            result.setdefault(w, []).append({
-                "id_atm": d["id_atm"], "lokasi": d.get("lokasi"),
-                "tipe": d.get("tipe"), "pct_saldo": d.get("pct_saldo"),
-                "status": d.get("status"), "skor_urgensi": d.get("skor_urgensi"),
-                "atm_sepi": d.get("atm_sepi", False),
-            })
+            result.setdefault(w, []).append({k: d[k] for k in ["id_atm","lokasi","tipe","denom_options","pct_saldo","status","skor_urgensi","atm_sepi"] if k in d})
         return _sanitize({"wilayah_list": list(result.keys()), "data": result})
 
 
@@ -972,20 +821,21 @@ def get_wilayah():
 # ════════════════════════════════════════════════════════════════════════════════
 
 class CashplanAddRequest(BaseModel):
-    id_atm:       str
-    lokasi:       str = "-"
-    wilayah:      str = "-"
-    tipe:         str = "-"
-    saldo:        int = 0
-    limit:        int = 0
-    pct_saldo:    float = 0
-    status:       str = "AWAS"
-    tgl_isi:      Optional[str] = None
-    jam_isi:      Optional[str] = None
-    est_jam:      Optional[float] = None
-    skor_urgensi: float = 0
-    denom:        int = 100000
-    added_by:     str = "user"
+    id_atm:        str
+    lokasi:        str = "-"
+    wilayah:       str = "-"
+    tipe:          str = "-"
+    denom_options: str = "100000"
+    saldo:         int = 0
+    limit:         int = 0
+    pct_saldo:     float = 0
+    status:        str = "AWAS"
+    tgl_isi:       Optional[str] = None
+    jam_isi:       Optional[str] = None
+    est_jam:       Optional[float] = None
+    skor_urgensi:  float = 0
+    denom:         int = 100000
+    added_by:      str = "user"
 
 
 class CashplanStatusUpdate(BaseModel):
@@ -996,7 +846,6 @@ class CashplanStatusUpdate(BaseModel):
 
 @app.post("/api/cashplan", tags=["CashPlan"])
 def api_add_cashplan(req: CashplanAddRequest):
-    """Tambah ATM ke antrian Cash Plan."""
     try:
         cp_id = add_to_cashplan(req.dict())
         return {"message": "Berhasil ditambahkan", "cashplan_id": cp_id}
@@ -1006,7 +855,6 @@ def api_add_cashplan(req: CashplanAddRequest):
 
 @app.get("/api/cashplan", tags=["CashPlan"])
 def api_get_cashplan(status: str = Query("PENDING")):
-    """List cashplan berdasarkan status (PENDING / DONE / REMOVED)."""
     try:
         items = get_cashplan_list(status.upper())
         return {"total": len(items), "data": items}
@@ -1016,21 +864,12 @@ def api_get_cashplan(status: str = Query("PENDING")):
 
 @app.patch("/api/cashplan/{cashplan_id}/status", tags=["CashPlan"])
 def api_update_cashplan_status(cashplan_id: int, body: CashplanStatusUpdate):
-    STATUS_MAP = {
-        "DONE":    "DONE",
-        "REMOVED": "REMOVED",
-        "SELESAI": "DONE",
-        "BATAL":   "REMOVED",
-    }
+    STATUS_MAP = {"DONE": "DONE", "REMOVED": "REMOVED", "SELESAI": "DONE", "BATAL": "REMOVED"}
     mapped = STATUS_MAP.get(body.status.upper())
     if not mapped:
         raise HTTPException(400, f"Status harus salah satu dari: {set(STATUS_MAP.keys())}")
     try:
-        result = update_cashplan_status(
-            cashplan_id, mapped,
-            keterangan=body.keterangan,
-            denom=body.denom,
-        )
+        result = update_cashplan_status(cashplan_id, mapped, keterangan=body.keterangan, denom=body.denom)
         return {"message": f"Status diubah ke {body.status.upper()}", **result}
     except ValueError as e:
         raise HTTPException(404, str(e))
@@ -1040,7 +879,7 @@ def api_update_cashplan_status(cashplan_id: int, body: CashplanStatusUpdate):
 
 @app.delete("/api/cashplan/{cashplan_id}", tags=["CashPlan"])
 def api_remove_cashplan(cashplan_id: int):
-    """Hapus (soft delete) satu item cashplan dari antrian. Tidak masuk rekap."""
+    """Hapus (soft delete) via tombol ✕ Remove — tidak masuk rekap."""
     try:
         remove_cashplan_only(cashplan_id)
         return {"message": "Cashplan dihapus dari antrian", "cashplan_id": cashplan_id}
@@ -1050,38 +889,81 @@ def api_remove_cashplan(cashplan_id: int):
         raise HTTPException(500, str(e))
 
 
+# ════════════════════════════════════════════════════════════════════════════════
+#  NOTIF CASHPLAN  (Bell notif)
+# ════════════════════════════════════════════════════════════════════════════════
+
+@app.get("/api/notif-cashplan", tags=["Notif"])
+def api_get_notif():
+    """
+    Ambil semua notif PENDING dari prediksi sistem.
+    User melihat ini di bell notif dan memutuskan: Approve / Dismiss.
+    """
+    try:
+        items = get_notif_pending()
+        return {"total": len(items), "data": items}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.post("/api/notif-cashplan/{notif_id}/approve", tags=["Notif"])
+def api_approve_notif(notif_id: int):
+    """
+    User approve notif → ATM masuk cashplan dengan added_by='notif'.
+    """
+    try:
+        cp_id = approve_notif(notif_id)
+        return {"message": "ATM berhasil ditambahkan ke cashplan", "cashplan_id": cp_id}
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.post("/api/notif-cashplan/{notif_id}/dismiss", tags=["Notif"])
+def api_dismiss_notif(notif_id: int):
+    """User dismiss notif → tidak masuk cashplan."""
+    try:
+        dismiss_notif(notif_id)
+        return {"message": "Notif berhasil di-dismiss"}
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.post("/api/notif-cashplan/dismiss-all", tags=["Notif"])
+def api_dismiss_all_notif():
+    """Dismiss semua notif PENDING sekaligus."""
+    try:
+        from database import get_conn
+        with get_conn() as conn:
+            conn.cursor().execute(
+                "UPDATE notif_cashplan SET status_notif='DISMISSED', decided_at=%s WHERE status_notif='PENDING'",
+                (datetime.now(),)
+            )
+        return {"message": "Semua notif berhasil di-dismiss"}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
 
 # ════════════════════════════════════════════════════════════════════════════════
 #  REKAP REPLACEMENT
 # ════════════════════════════════════════════════════════════════════════════════
+
 class RekapUpdateRequest(BaseModel):
     tgl_isi:      Optional[str] = None
     jam_cash_in:  Optional[str] = None
     jam_cash_out: Optional[str] = None
     denom:        Optional[int] = None
 
-@app.patch("/api/rekap-replacement/{rekap_id}", tags=["Rekap"])
-def api_update_rekap(rekap_id: int, body: RekapUpdateRequest):
-    """Simpan jam cash in/out, tanggal isi, denom ke rekap_replacement."""
-    try:
-        result = update_rekap_replacement(
-            rekap_id,
-            tgl_isi=body.tgl_isi,
-            jam_cash_in=body.jam_cash_in,
-            jam_cash_out=body.jam_cash_out,
-            denom=body.denom,
-        )
-        return {"message": "Rekap berhasil disimpan", **result}
-    except Exception as e:
-        raise HTTPException(500, str(e))
-    
+
 @app.get("/api/rekap-replacement", tags=["Rekap"])
 def api_get_rekap(
-    bulan:   Optional[str] = Query(None, description="Nama bulan Indonesia, e.g. Januari"),
+    bulan:   Optional[str] = Query(None),
     tahun:   Optional[int] = Query(None),
     wilayah: Optional[str] = Query(None),
 ):
-    """Daftar ATM yang sudah DONE dari Cash Plan."""
     try:
         items = get_rekap_replacement(bulan=bulan, tahun=tahun, wilayah=wilayah)
         return _sanitize({"total": len(items), "data": items})
@@ -1089,13 +971,97 @@ def api_get_rekap(
         raise HTTPException(500, str(e))
 
 
+@app.patch("/api/rekap-replacement/{rekap_id}", tags=["Rekap"])
+def api_update_rekap(rekap_id: int, body: RekapUpdateRequest):
+    try:
+        result = update_rekap_replacement(
+            rekap_id, tgl_isi=body.tgl_isi,
+            jam_cash_in=body.jam_cash_in, jam_cash_out=body.jam_cash_out, denom=body.denom,
+        )
+        return {"message": "Rekap berhasil disimpan", **result}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.get("/api/rekap-replacement/download", tags=["Rekap"])
+def api_download_rekap(
+    wilayah: Optional[str] = Query(None, description="Nama wilayah atau 'semua'"),
+    bulan:   Optional[str] = Query(None),
+    tahun:   Optional[int] = Query(None),
+    format:  str = Query("xlsx", description="xlsx atau csv"),
+):
+    """
+    Download rekap replacement sebagai file Excel atau CSV.
+    Filter by wilayah, bulan, tahun.
+    """
+    try:
+        rows = get_rekap_for_download(wilayah=wilayah, bulan=bulan, tahun=tahun)
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+    if not rows:
+        raise HTTPException(404, "Tidak ada data rekap untuk filter yang dipilih.")
+
+    df = pd.DataFrame(rows)
+
+    # Rename kolom untuk laporan
+    col_map = {
+        "id_atm":        "ID ATM",
+        "lokasi":        "Lokasi ATM",
+        "wilayah":       "Wilayah",
+        "tipe":          "Tipe",
+        "denom_options": "Denom Tersedia",
+        "saldo_awal":    "Saldo Awal (Rp)",
+        "limit":         "Limit (Rp)",
+        "jumlah_isi":    "Jumlah Isi (Rp)",
+        "denom":         "Denom Dipakai",
+        "lembar":        "Lembar",
+        "status_awal":   "Status Awal",
+        "status_done":   "Status",
+        "keterangan":    "Keterangan",
+        "tgl_isi":       "Tanggal Isi",
+        "jam_isi":       "Jam Isi",
+        "jam_cash_in":   "Jam Cash In",
+        "jam_cash_out":  "Jam Cash Out",
+        "done_at":       "Waktu Selesai",
+        "bulan":         "Bulan",
+        "tahun":         "Tahun",
+    }
+    df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
+
+    # Nama file
+    wilayah_label = (wilayah or "semua").lower().replace(" ", "_")
+    bulan_label   = f"_{bulan.lower()}" if bulan else ""
+    tahun_label   = f"_{tahun}" if tahun else ""
+    filename      = f"rekap_{wilayah_label}{bulan_label}{tahun_label}"
+
+    buf = io.BytesIO()
+
+    if format.lower() == "csv":
+        df.to_csv(buf, index=False, encoding="utf-8-sig")
+        buf.seek(0)
+        return StreamingResponse(
+            buf,
+            media_type="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="{filename}.csv"'},
+        )
+    else:
+        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+            df.to_excel(writer, index=False, sheet_name="Rekap Replacement")
+        buf.seek(0)
+        return StreamingResponse(
+            buf,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f'attachment; filename="{filename}.xlsx"'},
+        )
+
+
 # ════════════════════════════════════════════════════════════════════════════════
-#  ADMIN
+#  ADMIN / DEBUG
 # ════════════════════════════════════════════════════════════════════════════════
 
 @app.post("/api/clear-cache", tags=["Admin"])
 async def clear_cache():
-    """Hapus JSON prediction cache."""
     if PRED_CACHE.exists():
         PRED_CACHE.unlink()
         return {"message": "Cache dibersihkan"}
@@ -1104,33 +1070,60 @@ async def clear_cache():
 
 @app.delete("/api/data", tags=["Admin"])
 def reset_all():
-    """Reset semua data lokal (CSV, cache, model). MySQL tidak disentuh."""
     removed = []
     for p in [PROCESSED_CSV, PRED_CACHE, MODEL_PATH, FITUR_PATH]:
         if p.exists():
             p.unlink()
             removed.append(str(p))
-    _train_state.update({
-        "status": "idle", "progress": 0, "message": "",
-        "last_trained": None, "last_result": None,
-    })
+    _train_state.update({"status": "idle", "progress": 0, "message": "", "last_trained": None, "last_result": None})
     return {"message": "Reset berhasil", "removed_files": removed}
+
+
+@app.get("/api/upload-log/today", tags=["Admin"])
+def api_get_upload_log_today():
+    try:
+        from database import get_conn
+        with get_conn() as conn:
+            cur = conn.cursor(dictionary=True)
+            cur.execute("""SELECT id, filename, format, total_rows, atm_count, predictions, retrain, uploaded_at, status, notes
+                FROM upload_log WHERE DATE(uploaded_at)=CURDATE() ORDER BY uploaded_at DESC""")
+            rows = cur.fetchall()
+        for r in rows:
+            if r.get("uploaded_at"): r["uploaded_at"] = r["uploaded_at"].isoformat()
+            r["retrain"] = bool(r.get("retrain", 0))
+        return {"total": len(rows), "data": rows}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.get("/api/upload-log", tags=["Admin"])
+def api_get_upload_log(limit: int = Query(50, ge=1, le=200)):
+    try:
+        from database import get_conn
+        with get_conn() as conn:
+            cur = conn.cursor(dictionary=True)
+            cur.execute("""SELECT id, filename, format, total_rows, atm_count, predictions, retrain, uploaded_at, status, notes
+                FROM upload_log ORDER BY uploaded_at DESC LIMIT %s""", (limit,))
+            rows = cur.fetchall()
+        for r in rows:
+            if r.get("uploaded_at"): r["uploaded_at"] = r["uploaded_at"].isoformat()
+            r["retrain"] = bool(r.get("retrain", 0))
+        return {"total": len(rows), "data": rows}
+    except Exception as e:
+        raise HTTPException(500, str(e))
 
 
 @app.get("/api/debug/atm_ids", tags=["Debug"])
 def debug_atm_ids():
-    """Info debug: daftar ID ATM, vendor, wilayah dari CSV processed."""
     if not PROCESSED_CSV.exists():
         raise HTTPException(404, "Belum ada data.")
     df = pd.read_csv(PROCESSED_CSV, low_memory=False)
     df["ID ATM"] = df["ID ATM"].astype(str).str.strip().str.upper()
     df = df[~df["ID ATM"].isin(["", "NAN", "NONE", "NULL", "ID ATM"])]
-    result: dict = {"total_rows": len(df), "total_atm": df["ID ATM"].nunique()}
-    if "Vendor"  in df.columns:
-        result["vendor_unique"] = sorted(df["Vendor"].dropna().unique().tolist())
-    if "Wilayah" in df.columns:
-        result["wilayah_atm_count"] = df.groupby("Wilayah")["ID ATM"].nunique().to_dict()
-    if "Status" in df.columns:
+    result = {"total_rows": len(df), "total_atm": df["ID ATM"].nunique()}
+    if "Vendor"  in df.columns: result["vendor_unique"] = sorted(df["Vendor"].dropna().unique().tolist())
+    if "Wilayah" in df.columns: result["wilayah_atm_count"] = df.groupby("Wilayah")["ID ATM"].nunique().to_dict()
+    if "Status"  in df.columns:
         latest = df.sort_values("datetime").drop_duplicates("ID ATM", keep="last") if "datetime" in df.columns else df.drop_duplicates("ID ATM")
         result["status_distribution"] = latest["Status"].value_counts().to_dict()
     return result
@@ -1141,7 +1134,7 @@ def debug_atm_ids():
 # ════════════════════════════════════════════════════════════════════════════════
 
 async def _do_retrain(df: pd.DataFrame):
-    _train_state.update({"status": "running", "progress": 0, "message": "Memulai training V6..."})
+    _train_state.update({"status": "running", "progress": 0, "message": "Memulai training V7..."})
 
     def _cb(pct, msg):
         _train_state["progress"] = pct
@@ -1155,28 +1148,22 @@ async def _do_retrain(df: pd.DataFrame):
         loop   = asyncio.get_event_loop()
         result = await loop.run_in_executor(None, lambda: train(df, _cb))
 
-        _cb(95, "Rebuild prediksi cache V6...")
+        _cb(95, "Rebuild prediksi cache V7...")
         predictions = build_predictions(df)
         save_cache(predictions)
 
         try:
             upsert_predictions(predictions)
+            _sync_notif_from_predictions(predictions)
         except Exception as e:
             _train_state["message"] += f" | DB sync warning: {e}"
 
         _train_state.update({
             "status":       "done",
             "progress":     100,
-            "message":      (
-                f"Training V6 selesai ✅ "
-                f"MAE={result.get('mae_avg')} jam | R²={result.get('r2_avg')}"
-            ),
+            "message":      f"Training V7 selesai ✅ MAE={result.get('mae_avg')} jam | R²={result.get('r2_avg')}",
             "last_trained": datetime.now().isoformat(),
             "last_result":  result,
         })
     except Exception as e:
-        _train_state.update({
-            "status":   "error",
-            "progress": 0,
-            "message":  f"Error training: {str(e)}",
-        })
+        _train_state.update({"status": "error", "progress": 0, "message": f"Error training: {str(e)}"})
