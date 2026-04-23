@@ -5,7 +5,7 @@ import re
 import zipfile
 from datetime import datetime
 from typing import Optional
-
+import traceback
 import pandas as pd
 from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -32,7 +32,6 @@ from database import (
     get_rekap_for_download,
     update_rekap_replacement,
     log_upload,
-    # notif
     upsert_notif_cashplan,
     get_notif_pending,
     approve_notif,
@@ -41,7 +40,6 @@ from database import (
 
 
 def _sanitize(obj):
-    """Rekursif ganti NaN/Inf → None agar JSON-safe."""
     if isinstance(obj, float):
         if math.isnan(obj) or math.isinf(obj):
             return None
@@ -52,8 +50,6 @@ def _sanitize(obj):
         return [_sanitize(i) for i in obj]
     return obj
 
-
-# ── App ────────────────────────────────────────────────────────────────────────
 
 app = FastAPI(
     title="Smart ATM Dashboard API",
@@ -68,6 +64,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+from atm_masters_routes import router as masters_router
+app.include_router(masters_router)
 
 _train_state = {
     "status":       "idle",
@@ -89,13 +88,6 @@ def root():
         "version":    "7.0.0",
         "status":     "running",
         "time":       datetime.now().isoformat(),
-        "storage":    "MySQL + JSON Cache",
-        "thresholds": {
-            "aman":        "> 35%",
-            "perlu_pantau": "30–35%",
-            "awas":        "20–30%",
-            "bongkar":     "≤ 20%",
-        },
     }
 
 
@@ -187,9 +179,12 @@ def get_status():
                         "to":   str(date_row["date_to"])   if date_row["date_to"]   else "-",
                     }
 
-                # Jumlah notif pending
                 cur.execute("SELECT COUNT(*) AS cnt FROM notif_cashplan WHERE status_notif='PENDING'")
                 info["notif_pending"] = cur.fetchone()["cnt"]
+
+                # ── Info ATM Master vs Upload ──────────────────────────────
+                cur.execute("SELECT COUNT(*) AS cnt FROM atm_masters WHERE unit_pengisian='SSI'")
+                info["atm_master_ssi_count"] = cur.fetchone()["cnt"]
 
         except Exception as e:
             info["db_error"] = str(e)
@@ -204,6 +199,119 @@ def get_status():
             pass
 
     return _sanitize(info)
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+#  ATM MASTER vs MONITORING — endpoint baru untuk dashboard comparison
+# ════════════════════════════════════════════════════════════════════════════════
+
+@app.get("/api/dashboard/master-vs-monitoring", tags=["Dashboard"])
+def master_vs_monitoring():
+    """
+    Perbandingan antara ATM di master (SSI) dan ATM yang termonitor (ada di predictions).
+    Digunakan untuk fitur analisis di Dashboard.
+    """
+    try:
+        from database import get_conn
+        with get_conn() as conn:
+            cur = conn.cursor(dictionary=True)
+
+            # Semua ATM SSI di master
+            cur.execute("""
+                SELECT id_atm, lokasi_atm, wilayah, denom_options, `limit`, merk_atm
+                FROM atm_masters
+                WHERE unit_pengisian = 'SSI'
+                ORDER BY wilayah, id_atm
+            """)
+            master_rows = cur.fetchall()
+
+            # ATM yang ada di predictions (sudah pernah diupload)
+            cur.execute("""
+                SELECT id_atm, saldo, pct_saldo, status, last_update
+                FROM predictions
+            """)
+            pred_rows = cur.fetchall()
+
+            print("DEBUG MASTER ROWS:", len(master_rows))
+            print("DEBUG PRED ROWS:", len(pred_rows))
+
+            # cek contoh isi data pertama
+            if master_rows:
+                print("SAMPLE MASTER:", master_rows[0])
+            if pred_rows:
+                print("SAMPLE PRED:", pred_rows[0])
+
+        master_ids = {r["id_atm"] for r in master_rows}
+        pred_ids   = {r["id_atm"] for r in pred_rows}
+        pred_map   = {r["id_atm"]: r for r in pred_rows}
+
+        # ATM di master tapi belum pernah ada data upload
+        not_monitored = [
+            {
+                "id_atm":       r["id_atm"],
+                "lokasi_atm":   r["lokasi_atm"],
+                "wilayah":      r["wilayah"],
+                "denom_options":r["denom_options"],
+                "limit":        r["limit"],
+                "merk_atm":     r["merk_atm"],
+                "reason":       "Belum ada data upload",
+            }
+            for r in master_rows if r["id_atm"] not in pred_ids
+        ]
+
+        # ATM di predictions tapi tidak ada di master SSI
+        not_in_master = [
+            {
+                "id_atm":     r["id_atm"],
+                "lokasi":     r["lokasi"],
+                "wilayah":    r["wilayah"],
+                "saldo":      r["saldo"],
+                "pct_saldo":  r["pct_saldo"],
+                "status":     r["status"],
+                "last_update":str(r["last_update"]) if r["last_update"] else None,
+                "reason":     "Tidak ditemukan di ATM Master SSI",
+            }
+            for r in pred_rows if r["id_atm"] not in master_ids
+        ]
+
+        # ATM yang normal (ada di keduanya)
+        matched = len(master_ids & pred_ids)
+
+        # Breakdown per wilayah
+        wilayah_breakdown = {}
+        for r in master_rows:
+            w = r["wilayah"] or "Unknown"
+            if w not in wilayah_breakdown:
+                wilayah_breakdown[w] = {"master": 0, "monitored": 0, "not_monitored": 0}
+            wilayah_breakdown[w]["master"] += 1
+            if r["id_atm"] in pred_ids:
+                wilayah_breakdown[w]["monitored"] += 1
+            else:
+                wilayah_breakdown[w]["not_monitored"] += 1
+
+        return {
+            "summary": {
+                "total_master_ssi": len(master_ids),
+                "total_monitored": len(pred_ids),
+                "matched": matched,
+                "not_monitored": len(not_monitored),
+                "not_in_master": len(not_in_master),
+                "coverage_pct": round(matched / max(len(master_ids), 1) * 100, 1),
+            },
+            "not_monitored": not_monitored,
+            "not_in_master": not_in_master,
+            "wilayah_breakdown": [
+                {"wilayah": w, **v} for w, v in wilayah_breakdown.items()
+            ],
+        }
+    
+
+    except Exception as e:
+        print("\n=== ERROR master-vs-monitoring ===")
+        print("Error message:", str(e))
+        traceback.print_exc()
+        print("=================================\n")
+        raise HTTPException(500, str(e))
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -270,6 +378,7 @@ def _read_tabular(zf: zipfile.ZipFile, name: str) -> pd.DataFrame:
 
 
 def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize kolom dari file upload — hanya perlu ID ATM & Sisa Saldo."""
     df = df.copy()
     df.columns = [str(c).strip() for c in df.columns]
     col_rename = {}
@@ -277,26 +386,12 @@ def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
         c = col.lower().strip()
         if 'id' in c and 'atm' in c:
             col_rename[col] = 'ID ATM'
-        elif c in ('merk atm', 'merk', 'brand'):
-            col_rename[col] = 'Merk ATM'
-        elif 'lokasi' in c and 'atm' in c:
-            col_rename[col] = 'Lokasi ATM'
-        elif 'lokasi' in c:
-            col_rename[col] = 'Lokasi ATM'
-        elif 'alamat' in c:
-            col_rename[col] = 'Alamat ATM'
-        elif 'vendor' in c:
-            col_rename[col] = 'Vendor'
-        elif c == 'limit':
-            col_rename[col] = 'Limit'
         elif 'sisa' in c and 'saldo' in c:
             col_rename[col] = 'Sisa Saldo'
         elif c in ('tanggal', 'date', 'tgl'):
             col_rename[col] = 'Tanggal'
         elif c in ('jam', 'time', 'waktu'):
             col_rename[col] = 'Jam'
-        elif c == 'denom':
-            col_rename[col] = 'Denom'   # pastikan kolom Denom terbawa
     return df.rename(columns=col_rename)
 
 
@@ -346,9 +441,8 @@ def _parse_zip(zip_bytes: bytes):
                 errors.append(f"Gagal baca {name}: {e}")
                 continue
             df_file = _normalize_columns(df_file)
-            missing = {"ID ATM", "Sisa Saldo", "Limit"} - set(df_file.columns)
-            if missing:
-                errors.append(f"Skip (kolom {missing} tidak ditemukan): {name}")
+            if "ID ATM" not in df_file.columns or "Sisa Saldo" not in df_file.columns:
+                errors.append(f"Skip (kolom ID ATM/Sisa Saldo tidak ditemukan): {name}")
                 continue
             df_file["Tanggal"] = tanggal_str
             df_file["Jam"]     = jam_str
@@ -364,6 +458,124 @@ def _parse_zip(zip_bytes: bytes):
 
 
 # ════════════════════════════════════════════════════════════════════════════════
+#  ENRICH FROM ATM MASTER — INTI PERUBAHAN
+#  Ambil data ATM dari atm_masters (unit_pengisian=SSI),
+#  cocokkan dengan ID ATM dari file upload.
+#  Hanya Sisa Saldo yang diambil dari file.
+# ════════════════════════════════════════════════════════════════════════════════
+
+def _enrich_from_master(df_upload: pd.DataFrame) -> tuple[pd.DataFrame, list, list]:
+    """
+    Input  : df_upload — minimal punya kolom: ID ATM, Sisa Saldo, Tanggal, Jam
+    Output : (df_enriched, warnings, skipped_ids)
+
+    - df_enriched : DataFrame lengkap siap masuk processing
+    - warnings    : list string pesan warning untuk response
+    - skipped_ids : list ID ATM yang tidak ditemukan di master SSI
+    """
+    from database import get_conn
+
+    # Ambil semua ATM SSI dari master
+    with get_conn() as conn:
+        cur = conn.cursor(dictionary=True)
+        cur.execute("""
+            SELECT
+                id_atm,
+                merk_atm,
+                lokasi_atm,
+                alamat_atm,
+                denom_options,
+                lembar,
+                wilayah,
+                `limit`,
+                nama_vendor
+            FROM atm_masters
+            WHERE unit_pengisian = 'SSI'
+        """)
+        master_rows = cur.fetchall()
+
+    if not master_rows:
+        raise HTTPException(500, "Tidak ada data ATM Master dengan unit_pengisian='SSI'. Import ATM Master terlebih dahulu.")
+
+    # Buat dict id_atm → row master (case-insensitive)
+    master_map = {r["id_atm"].strip().upper(): r for r in master_rows}
+
+    # Normalize ID ATM dari file upload
+    df_upload = df_upload.copy()
+    df_upload["ID ATM"] = df_upload["ID ATM"].astype(str).str.strip().str.upper()
+    df_upload = df_upload[~df_upload["ID ATM"].isin(["", "NAN", "NONE", "NULL", "ID ATM"])]
+
+    upload_ids  = df_upload["ID ATM"].unique().tolist()
+    matched_ids = []
+    skipped_ids = []
+
+    for atm_id in upload_ids:
+        if atm_id in master_map:
+            matched_ids.append(atm_id)
+        else:
+            skipped_ids.append(atm_id)
+
+    warnings = []
+    if skipped_ids:
+        for sid in skipped_ids:
+            warnings.append(f"ID ATM '{sid}' tidak ditemukan di ATM Master SSI — dilewati")
+
+    if not matched_ids:
+        raise HTTPException(
+            400,
+            f"Tidak ada ID ATM dari file yang cocok dengan ATM Master SSI. "
+            f"ID dari file: {upload_ids[:10]}. Pastikan ATM Master sudah diimport."
+        )
+
+    # Filter hanya ID yang match
+    df_matched = df_upload[df_upload["ID ATM"].isin(matched_ids)].copy()
+
+    # Enrich dengan data dari master
+    enriched_rows = []
+    for _, row in df_matched.iterrows():
+        atm_id  = row["ID ATM"]
+        master  = master_map[atm_id]
+
+        # Parse limit dari master
+        try:
+            limit_val = float(str(master["limit"]).replace(",", "").replace(".", "").strip()) if master["limit"] else 0
+        except Exception:
+            limit_val = 0
+
+        # Wilayah → format untuk Vendor field (dipakai processing._clean_vendor)
+        wilayah_raw = master.get("wilayah") or "Unknown"
+
+        # Mapping wilayah → nomor vendor SSI (sesuai format lama)
+        wilayah_vendor_map = {
+            "Pekanbaru":     "1 - SSI Wilayah Pekanbaru",
+            "Batam":         "2 - SSI Wilayah Batam",
+            "Tanjung Pinang":"3 - SSI Wilayah Tanjung Pinang",
+            "Tanjungpinang": "3 - SSI Wilayah Tanjung Pinang",
+            "Dumai":         "4 - SSI Wilayah Dumai",
+        }
+        vendor_str = wilayah_vendor_map.get(wilayah_raw, f"1 - SSI Wilayah {wilayah_raw}")
+
+        enriched_rows.append({
+            "ID ATM":    atm_id,
+            "Sisa Saldo": row["Sisa Saldo"],
+            "Tanggal":   row.get("Tanggal", datetime.now().strftime("%Y-%m-%d")),
+            "Jam":       row.get("Jam", datetime.now().strftime("%H:00")),
+            # Data dari master
+            "Merk ATM":  master.get("merk_atm") or "-",
+            "Lokasi ATM":master.get("lokasi_atm") or "-",
+            "Alamat ATM":master.get("alamat_atm") or "-",
+            "Denom":     master.get("denom_options") or "100",
+            "Limit":     limit_val,
+            "Vendor":    vendor_str,
+            "Wilayah":   wilayah_raw,
+        })
+
+    df_enriched = pd.DataFrame(enriched_rows)
+
+    return df_enriched, warnings, skipped_ids
+
+
+# ════════════════════════════════════════════════════════════════════════════════
 #  UPLOAD
 # ════════════════════════════════════════════════════════════════════════════════
 
@@ -376,38 +588,57 @@ async def upload_data(
     fname   = file.filename or ""
     content = await file.read()
     parse_warnings = []
+    skipped_ids    = []
 
+    # ── 1. Baca file → ambil ID ATM + Sisa Saldo saja ────────────────────────
     if fname.lower().endswith(".zip"):
-        df_new, parse_warnings = _parse_zip(content)
-        is_processed = False
+        df_raw, parse_warnings = _parse_zip(content)
+        # df_raw dari ZIP sudah ada Tanggal & Jam dari nama file
     elif fname.lower().endswith((".xlsx", ".xls", ".xlsm")):
-        df_new = _read_excel_or_csv(content, fname)
-        df_new = _normalize_columns(df_new)
+        df_raw = _read_excel_or_csv(content, fname)
+        df_raw = _normalize_columns(df_raw)
         _now = datetime.now()
-        if "Tanggal" not in df_new.columns:
-            df_new["Tanggal"] = _now.strftime("%Y-%m-%d")
-        if "Jam" not in df_new.columns:
-            df_new["Jam"] = _now.strftime("%H:00")
-        is_processed = "Avg Penarikan 6j" in df_new.columns
+        if "Tanggal" not in df_raw.columns:
+            df_raw["Tanggal"] = _now.strftime("%Y-%m-%d")
+        if "Jam" not in df_raw.columns:
+            df_raw["Jam"] = _now.strftime("%H:00")
     elif fname.lower().endswith(".csv"):
-        df_new = _read_excel_or_csv(content, fname)
-        df_new = _normalize_columns(df_new)
+        df_raw = _read_excel_or_csv(content, fname)
+        df_raw = _normalize_columns(df_raw)
         _now = datetime.now()
-        if "Tanggal" not in df_new.columns:
-            df_new["Tanggal"] = _now.strftime("%Y-%m-%d")
-        if "Jam" not in df_new.columns:
-            df_new["Jam"] = _now.strftime("%H:00")
-        is_processed = "Avg Penarikan 6j" in df_new.columns
+        if "Tanggal" not in df_raw.columns:
+            df_raw["Tanggal"] = _now.strftime("%Y-%m-%d")
+        if "Jam" not in df_raw.columns:
+            df_raw["Jam"] = _now.strftime("%H:00")
     else:
         raise HTTPException(400, f"Format tidak didukung: {fname}. Gunakan ZIP, XLSX, atau CSV.")
 
-    if df_new.empty:
+    if df_raw.empty:
         raise HTTPException(400, "File kosong atau tidak ada data yang bisa dibaca.")
 
-    for col in ["ID ATM", "Sisa Saldo", "Limit"]:
-        if col not in df_new.columns:
-            raise HTTPException(400, f"Kolom wajib '{col}' tidak ditemukan. Kolom yang ada: {list(df_new.columns)}")
+    # Validasi kolom minimal
+    for col in ["ID ATM", "Sisa Saldo"]:
+        if col not in df_raw.columns:
+            raise HTTPException(
+                400,
+                f"Kolom wajib '{col}' tidak ditemukan. "
+                f"Kolom yang ada: {list(df_raw.columns)}. "
+                f"File monitoring hanya memerlukan kolom: ID ATM dan Sisa Saldo."
+            )
 
+    # ── 2. Enrich dari ATM Master ─────────────────────────────────────────────
+    try:
+        df_new, master_warnings, skipped_ids = _enrich_from_master(df_raw)
+        parse_warnings.extend(master_warnings)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"Gagal mengambil data dari ATM Master: {str(e)}")
+
+    if df_new.empty:
+        raise HTTPException(400, "Tidak ada data valid setelah pencocokan dengan ATM Master SSI.")
+
+    # ── 3. Proses data (sama seperti sebelumnya) ──────────────────────────────
     try:
         if PROCESSED_CSV.exists():
             df_old = pd.read_csv(PROCESSED_CSV, low_memory=False)
@@ -415,16 +646,11 @@ async def upload_data(
             df_old["ID ATM"] = df_old["ID ATM"].astype(str).str.strip().str.upper()
             df_new["ID ATM"] = df_new["ID ATM"].astype(str).str.strip().str.upper()
 
-            if is_processed and is_old_processed:
-                df_merged = pd.concat([df_old, df_new], ignore_index=True)
-                if "datetime" in df_merged.columns:
-                    df_merged["datetime"] = pd.to_datetime(df_merged["datetime"])
-                    df_merged = df_merged.drop_duplicates(subset=["ID ATM", "datetime"])
-                df_final = df_merged
-            elif not is_processed and is_old_processed:
+            if is_old_processed:
                 tanggal_baru = set(df_new["Tanggal"].astype(str).str[:10].unique())
                 raw_cols = ["ID ATM", "Sisa Saldo", "Limit", "Tanggal", "Jam",
-                            "Merk ATM", "Lokasi ATM", "Alamat ATM", "Vendor", "Denom"]
+                            "Merk ATM", "Lokasi ATM", "Alamat ATM", "Vendor", "Denom",
+                            "Wilayah"]
                 raw_cols_available = [c for c in raw_cols if c in df_old.columns]
                 df_old_raw = df_old[raw_cols_available].copy()
                 df_old_raw = df_old_raw[
@@ -442,7 +668,7 @@ async def upload_data(
                 df_combined = df_combined.drop_duplicates(subset=["ID ATM", "Tanggal", "Jam"])
                 df_final = process_dataframe(df_combined)
         else:
-            df_final = df_new if is_processed else process_dataframe(df_new)
+            df_final = process_dataframe(df_new)
 
     except HTTPException:
         raise
@@ -473,11 +699,7 @@ async def upload_data(
             upsert_predictions(predictions)
         bulk_insert_history(df_final)
         db_synced = True
-
-        # Sync notif_cashplan dari prediksi terbaru
-        # ATM yang masuk zona trigger (pct <= TRIGGER_CASHPLAN_PCT) dimasukkan ke notif
         _sync_notif_from_predictions(predictions)
-
     except Exception as e:
         parse_warnings.append(f"[DB Warning] {str(e)}")
 
@@ -487,8 +709,11 @@ async def upload_data(
             "ZIP" if fname.lower().endswith(".zip") else "CSV/Excel",
             len(df_final),
             df_final["ID ATM"].nunique() if "ID ATM" in df_final.columns else 0,
-            len(predictions),
-            retrain,
+            matched=int(df_new["ID ATM"].nunique()) if "ID ATM" in df_new.columns else 0,
+            skipped=len(skipped_ids),
+            predictions=len(predictions),
+            retrain=retrain,
+            notes=f"Skipped IDs: {skipped_ids}" if skipped_ids else None,
         )
     except Exception as e:
         parse_warnings.append(f"[Log Warning] {str(e)}")
@@ -497,11 +722,15 @@ async def upload_data(
         "message":      "Upload berhasil",
         "version":      "V7",
         "format":       "ZIP" if fname.lower().endswith(".zip") else "Excel/CSV",
-        "is_processed": is_processed,
+        "total_file":   int(df_raw["ID ATM"].nunique()) if "ID ATM" in df_raw.columns else 0,
+        "matched":      int(df_new["ID ATM"].nunique()) if "ID ATM" in df_new.columns else 0,
+        "skipped":      len(skipped_ids),
+        "skipped_ids":  skipped_ids,
         "rows":         len(df_final),
         "atm_count":    int(df_final["ID ATM"].nunique()) if "ID ATM" in df_final.columns else 0,
         "predictions":  len(predictions),
         "db_synced":    db_synced,
+        "source":       "Data ATM (Merk, Lokasi, Limit, Denom, Wilayah) diambil dari ATM Master SSI",
     }
     if parse_warnings:
         resp["warnings"] = parse_warnings[:15]
@@ -514,36 +743,25 @@ async def upload_data(
 
 
 def _sync_notif_from_predictions(predictions: list):
-    """
-    Setelah upload, ATM dengan pct_saldo <= TRIGGER_CASHPLAN_PCT dimasukkan ke notif.
-    ATM dengan pct_saldo <= AUTO_CASHPLAN_PCT langsung masuk cashplan (system).
-    ATM yang sudah ada di cashplan PENDING tidak dimasukkan lagi.
-    """
     from database import get_conn
-
-    # Ambil semua ATM yang sudah PENDING di cashplan
     with get_conn() as conn:
         cur = conn.cursor(dictionary=True)
         cur.execute("SELECT id_atm FROM cashplan WHERE status_cashplan='PENDING'")
         pending_ids = {r["id_atm"] for r in cur.fetchall()}
 
     for p in predictions:
-        atm_id  = p.get("id_atm", "")
-        pct     = float(p.get("pct_saldo", 100) or 100)
-        status  = p.get("status", "")
+        atm_id = p.get("id_atm", "")
+        pct    = float(p.get("pct_saldo", 100) or 100)
 
         if atm_id in pending_ids:
-            continue  # sudah ada di cashplan, skip
+            continue
 
         if pct <= AUTO_CASHPLAN_PCT * 100:
-            # Auto masuk cashplan
             try:
                 add_to_cashplan({**p, "added_by": "system"})
             except Exception:
                 pass
-
         elif pct <= TRIGGER_CASHPLAN_PCT * 100:
-            # Masuk notif untuk diputuskan user
             try:
                 upsert_notif_cashplan(p)
             except Exception:
@@ -684,20 +902,25 @@ def get_summary():
             cur.execute("SELECT status, COUNT(*) AS cnt FROM predictions GROUP BY status")
             status_breakdown = {r["status"]: r["cnt"] for r in cur.fetchall()}
 
+            # Tambahan: total master SSI
+            cur.execute("SELECT COUNT(*) AS cnt FROM atm_masters WHERE unit_pengisian='SSI'")
+            master_ssi_count = cur.fetchone()["cnt"]
+
         def _i(v): return int(v or 0)
         def _f(v): return float(v or 0.0)
 
         overall = {
-            "total_atm":      _i(ov_row["total_atm"]),
-            "bongkar":        _i(ov_row["bongkar"]),
-            "awas":           _i(ov_row["awas"]),
-            "perlu_pantau":   _i(ov_row["perlu_pantau"]),
-            "aman":           _i(ov_row["aman"]),
-            "overfund":       _i(ov_row["overfund"]),
-            "atm_sepi":       _i(ov_row["atm_sepi"]),
-            "avg_pct_saldo":  _f(ov_row["avg_pct_saldo"]),
-            "status_breakdown": status_breakdown,
-            "kritis":         _i(ov_row["bongkar"]),
+            "total_atm":         _i(ov_row["total_atm"]),
+            "bongkar":           _i(ov_row["bongkar"]),
+            "awas":              _i(ov_row["awas"]),
+            "perlu_pantau":      _i(ov_row["perlu_pantau"]),
+            "aman":              _i(ov_row["aman"]),
+            "overfund":          _i(ov_row["overfund"]),
+            "atm_sepi":          _i(ov_row["atm_sepi"]),
+            "avg_pct_saldo":     _f(ov_row["avg_pct_saldo"]),
+            "status_breakdown":  status_breakdown,
+            "kritis":            _i(ov_row["bongkar"]),
+            "total_master_ssi":  int(master_ssi_count),
         }
         gen_at = ov_row["generated_at"].isoformat() if ov_row.get("generated_at") else None
         per_wilayah = [{
@@ -732,6 +955,7 @@ def get_summary():
             "atm_sepi": sum(1 for d in data if d.get("atm_sepi")),
             "avg_pct_saldo": round(sum(pct_values) / max(len(pct_values), 1), 1),
             "status_breakdown": status_counts, "kritis": status_counts.get("BONGKAR", 0),
+            "total_master_ssi": 0,
         }
         wilayah_map = {}
         for d in data:
@@ -879,7 +1103,6 @@ def api_update_cashplan_status(cashplan_id: int, body: CashplanStatusUpdate):
 
 @app.delete("/api/cashplan/{cashplan_id}", tags=["CashPlan"])
 def api_remove_cashplan(cashplan_id: int):
-    """Hapus (soft delete) via tombol ✕ Remove — tidak masuk rekap."""
     try:
         remove_cashplan_only(cashplan_id)
         return {"message": "Cashplan dihapus dari antrian", "cashplan_id": cashplan_id}
@@ -890,15 +1113,11 @@ def api_remove_cashplan(cashplan_id: int):
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-#  NOTIF CASHPLAN  (Bell notif)
+#  NOTIF CASHPLAN
 # ════════════════════════════════════════════════════════════════════════════════
 
 @app.get("/api/notif-cashplan", tags=["Notif"])
 def api_get_notif():
-    """
-    Ambil semua notif PENDING dari prediksi sistem.
-    User melihat ini di bell notif dan memutuskan: Approve / Dismiss.
-    """
     try:
         items = get_notif_pending()
         return {"total": len(items), "data": items}
@@ -908,9 +1127,6 @@ def api_get_notif():
 
 @app.post("/api/notif-cashplan/{notif_id}/approve", tags=["Notif"])
 def api_approve_notif(notif_id: int):
-    """
-    User approve notif → ATM masuk cashplan dengan added_by='notif'.
-    """
     try:
         cp_id = approve_notif(notif_id)
         return {"message": "ATM berhasil ditambahkan ke cashplan", "cashplan_id": cp_id}
@@ -922,7 +1138,6 @@ def api_approve_notif(notif_id: int):
 
 @app.post("/api/notif-cashplan/{notif_id}/dismiss", tags=["Notif"])
 def api_dismiss_notif(notif_id: int):
-    """User dismiss notif → tidak masuk cashplan."""
     try:
         dismiss_notif(notif_id)
         return {"message": "Notif berhasil di-dismiss"}
@@ -934,7 +1149,6 @@ def api_dismiss_notif(notif_id: int):
 
 @app.post("/api/notif-cashplan/dismiss-all", tags=["Notif"])
 def api_dismiss_all_notif():
-    """Dismiss semua notif PENDING sekaligus."""
     try:
         from database import get_conn
         with get_conn() as conn:
@@ -985,15 +1199,11 @@ def api_update_rekap(rekap_id: int, body: RekapUpdateRequest):
 
 @app.get("/api/rekap-replacement/download", tags=["Rekap"])
 def api_download_rekap(
-    wilayah: Optional[str] = Query(None, description="Nama wilayah atau 'semua'"),
+    wilayah: Optional[str] = Query(None),
     bulan:   Optional[str] = Query(None),
     tahun:   Optional[int] = Query(None),
-    format:  str = Query("xlsx", description="xlsx atau csv"),
+    format:  str = Query("xlsx"),
 ):
-    """
-    Download rekap replacement sebagai file Excel atau CSV.
-    Filter by wilayah, bulan, tahun.
-    """
     try:
         rows = get_rekap_for_download(wilayah=wilayah, bulan=bulan, tahun=tahun)
     except Exception as e:
@@ -1003,57 +1213,36 @@ def api_download_rekap(
         raise HTTPException(404, "Tidak ada data rekap untuk filter yang dipilih.")
 
     df = pd.DataFrame(rows)
-
-    # Rename kolom untuk laporan
     col_map = {
-        "id_atm":        "ID ATM",
-        "lokasi":        "Lokasi ATM",
-        "wilayah":       "Wilayah",
-        "tipe":          "Tipe",
-        "denom_options": "Denom Tersedia",
-        "saldo_awal":    "Saldo Awal (Rp)",
-        "limit":         "Limit (Rp)",
-        "jumlah_isi":    "Jumlah Isi (Rp)",
-        "denom":         "Denom Dipakai",
-        "lembar":        "Lembar",
-        "status_awal":   "Status Awal",
-        "status_done":   "Status",
-        "keterangan":    "Keterangan",
-        "tgl_isi":       "Tanggal Isi",
-        "jam_isi":       "Jam Isi",
-        "jam_cash_in":   "Jam Cash In",
-        "jam_cash_out":  "Jam Cash Out",
-        "done_at":       "Waktu Selesai",
-        "bulan":         "Bulan",
-        "tahun":         "Tahun",
+        "id_atm": "ID ATM", "lokasi": "Lokasi ATM", "wilayah": "Wilayah",
+        "tipe": "Tipe", "denom_options": "Denom Tersedia",
+        "saldo_awal": "Saldo Awal (Rp)", "limit": "Limit (Rp)",
+        "jumlah_isi": "Jumlah Isi (Rp)", "denom": "Denom Dipakai",
+        "lembar": "Lembar", "status_awal": "Status Awal", "status_done": "Status",
+        "keterangan": "Keterangan", "tgl_isi": "Tanggal Isi", "jam_isi": "Jam Isi",
+        "jam_cash_in": "Jam Cash In", "jam_cash_out": "Jam Cash Out",
+        "done_at": "Waktu Selesai", "bulan": "Bulan", "tahun": "Tahun",
     }
     df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
 
-    # Nama file
     wilayah_label = (wilayah or "semua").lower().replace(" ", "_")
     bulan_label   = f"_{bulan.lower()}" if bulan else ""
     tahun_label   = f"_{tahun}" if tahun else ""
     filename      = f"rekap_{wilayah_label}{bulan_label}{tahun_label}"
 
     buf = io.BytesIO()
-
     if format.lower() == "csv":
         df.to_csv(buf, index=False, encoding="utf-8-sig")
         buf.seek(0)
-        return StreamingResponse(
-            buf,
-            media_type="text/csv",
-            headers={"Content-Disposition": f'attachment; filename="{filename}.csv"'},
-        )
+        return StreamingResponse(buf, media_type="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="{filename}.csv"'})
     else:
         with pd.ExcelWriter(buf, engine="openpyxl") as writer:
             df.to_excel(writer, index=False, sheet_name="Rekap Replacement")
         buf.seek(0)
-        return StreamingResponse(
-            buf,
+        return StreamingResponse(buf,
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={"Content-Disposition": f'attachment; filename="{filename}.xlsx"'},
-        )
+            headers={"Content-Disposition": f'attachment; filename="{filename}.xlsx"'})
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -1111,22 +1300,6 @@ def api_get_upload_log(limit: int = Query(50, ge=1, le=200)):
         return {"total": len(rows), "data": rows}
     except Exception as e:
         raise HTTPException(500, str(e))
-
-
-@app.get("/api/debug/atm_ids", tags=["Debug"])
-def debug_atm_ids():
-    if not PROCESSED_CSV.exists():
-        raise HTTPException(404, "Belum ada data.")
-    df = pd.read_csv(PROCESSED_CSV, low_memory=False)
-    df["ID ATM"] = df["ID ATM"].astype(str).str.strip().str.upper()
-    df = df[~df["ID ATM"].isin(["", "NAN", "NONE", "NULL", "ID ATM"])]
-    result = {"total_rows": len(df), "total_atm": df["ID ATM"].nunique()}
-    if "Vendor"  in df.columns: result["vendor_unique"] = sorted(df["Vendor"].dropna().unique().tolist())
-    if "Wilayah" in df.columns: result["wilayah_atm_count"] = df.groupby("Wilayah")["ID ATM"].nunique().to_dict()
-    if "Status"  in df.columns:
-        latest = df.sort_values("datetime").drop_duplicates("ID ATM", keep="last") if "datetime" in df.columns else df.drop_duplicates("ID ATM")
-        result["status_distribution"] = latest["Status"].value_counts().to_dict()
-    return result
 
 
 # ════════════════════════════════════════════════════════════════════════════════
