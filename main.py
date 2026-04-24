@@ -818,21 +818,45 @@ def get_predictions(
 
 @app.get("/api/predictions/{atm_id}", tags=["Predictions"])
 def get_prediction_detail(atm_id: str):
+    """
+    FIX v7.1: LEFT JOIN ke atm_masters agar lokasi/wilayah/limit/tipe/denom_options
+    ikut dalam response — dibutuhkan oleh modal Konfirmasi Cash Plan (manual).
+    Pakai LEFT JOIN (bukan INNER) agar ATM yang belum ada di master tetap bisa dibuka.
+    """
     try:
-        from database import get_conn
+        from database import get_conn, _fmt_pred
+
+        _JOIN_DETAIL = """
+            SELECT
+                p.*,
+                COALESCE(m.lokasi_atm, '-')   AS lokasi,
+                COALESCE(m.wilayah,    '-')   AS wilayah,
+                COALESCE(m.denom_options, '100000') AS denom_options,
+                COALESCE(m.`limit`, 0)         AS `limit`,
+                m.merk_atm,
+                m.alamat_atm,
+                m.nama_vendor,
+                m.kode_cabang,
+                UPPER(LEFT(p.id_atm, 3))       AS tipe
+            FROM predictions p
+            LEFT JOIN atm_masters m ON p.id_atm = m.id_atm
+            WHERE p.id_atm = %s
+        """
+
         with get_conn() as conn:
             cur = conn.cursor(dictionary=True)
-            cur.execute("SELECT * FROM predictions WHERE id_atm=%s", (atm_id.upper(),))
+            cur.execute(_JOIN_DETAIL, (atm_id.strip().upper(),))
             row = cur.fetchone()
+
         if not row:
             raise HTTPException(404, f"ATM {atm_id} tidak ditemukan di database.")
-        for f in ["generated_at", "last_update", "tgl_awas", "tgl_habis", "tgl_isi"]:
-            if row.get(f): row[f] = str(row[f])
-        row["atm_sepi"] = bool(row.get("atm_sepi", 0))
-        return _sanitize(row)
+
+        return _sanitize(_fmt_pred(row))
+
     except HTTPException:
         raise
     except Exception:
+        # fallback cache
         cache = load_cache()
         if cache is None:
             raise HTTPException(404, "Belum ada prediksi.")
@@ -840,7 +864,6 @@ def get_prediction_detail(atm_id: str):
         if not match:
             raise HTTPException(404, f"ATM {atm_id} tidak ditemukan.")
         return _sanitize(match[0])
-
 
 # ════════════════════════════════════════════════════════════════════════════════
 #  ALERTS & SUMMARY
@@ -1058,20 +1081,22 @@ class CashplanAddRequest(BaseModel):
     jam_isi:       Optional[str] = None
     est_jam:       Optional[float] = None
     skor_urgensi:  float = 0
-    denom:         int = 100000
+    denom:         str = "100000"
     added_by:      str = "user"
 
 
 class CashplanStatusUpdate(BaseModel):
     status:      str
     keterangan:  Optional[str] = None
-    denom:       Optional[int] = None
+    denom:       Optional[str] = None
 
 
 @app.post("/api/cashplan", tags=["CashPlan"])
 def api_add_cashplan(req: CashplanAddRequest):
     try:
-        cp_id = add_to_cashplan(req.dict())
+        data = req.dict()
+        # denom sudah string, add_to_cashplan expects string — langsung pass
+        cp_id = add_to_cashplan(data)
         return {"message": "Berhasil ditambahkan", "cashplan_id": cp_id}
     except Exception as e:
         raise HTTPException(500, str(e))

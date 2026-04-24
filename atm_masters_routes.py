@@ -212,7 +212,6 @@ _COL_SANITIZERS = {
     "nomor":          _clean_int,
     "is_vendor":      _clean_int,
     # INT tapi sering format ribuan "1,500"
-    "lembar":         _clean_lembar,
     # DECIMAL(6,2)
     "pct_saldo":      _clean_pct,
     # BIGINT
@@ -231,7 +230,7 @@ _STR_COLS = {
     "wilayah", "alamat_atm", "tipe_mesin", "off_on_bank", "status_pemilik",
     "nama_vendor", "maintenance", "vendor_maintenance",
     "sisa_hari", "nama_asuransi", "link_komunikasi",
-    "bw", "media", "isp", "no_inventaris", "unit_pengisian", "is_tms",
+    "bw", "media", "isp", "no_inventaris", "unit_pengisian", "is_tms","lembar",
 }
 
 
@@ -393,13 +392,14 @@ def _serialize(row: dict) -> dict:
 # ════════════════════════════════════════════════════════════
 @router.get("/api/atm-masters")
 def list_atm_masters(
-    search:  Optional[str] = Query(None),
-    wilayah: Optional[str] = Query(None),
-    limit:   int           = Query(20, ge=1, le=200),
-    offset:  int           = Query(0, ge=0),
+    search:         Optional[str] = Query(None),
+    wilayah:        Optional[str] = Query(None),
+    unit_pengisian: Optional[str] = Query(None),          # ← TAMBAH
+    limit:          int           = Query(20, ge=1, le=10000),  # ← le=200 → le=10000
+    offset:         int           = Query(0, ge=0),
 ):
-    logger.debug("LIST | search=%r wilayah=%r limit=%d offset=%d",
-                 search, wilayah, limit, offset)
+    logger.debug("LIST | search=%r wilayah=%r unit_pengisian=%r limit=%d offset=%d",
+                 search, wilayah, unit_pengisian, limit, offset)
     try:
         from database import get_conn
         where, params = [], []
@@ -409,6 +409,9 @@ def list_atm_masters(
         if wilayah:
             where.append("wilayah = %s")
             params.append(wilayah)
+        if unit_pengisian:                                 # ← TAMBAH BLOCK INI
+            where.append("unit_pengisian = %s")
+            params.append(unit_pengisian)
 
         where_sql = ("WHERE " + " AND ".join(where)) if where else ""
 
@@ -429,12 +432,19 @@ def list_atm_masters(
             )
             wilayah_opts = [r["wilayah"] for r in cur.fetchall()]
 
+            cur.execute(                                   # ← TAMBAH BLOCK INI
+                "SELECT DISTINCT unit_pengisian FROM atm_masters "
+                "WHERE unit_pengisian IS NOT NULL AND unit_pengisian != '' ORDER BY unit_pengisian"
+            )
+            unit_opts = [r["unit_pengisian"] for r in cur.fetchall()]
+
         return {
-            "total":           total,
-            "limit":           limit,
-            "offset":          offset,
-            "data":            [_serialize(r) for r in rows],
-            "wilayah_options": wilayah_opts,
+            "total":                  total,
+            "limit":                  limit,
+            "offset":                 offset,
+            "data":                   [_serialize(r) for r in rows],
+            "wilayah_options":        wilayah_opts,
+            "unit_pengisian_options": unit_opts,           # ← TAMBAH
         }
     except HTTPException:
         raise

@@ -586,7 +586,7 @@ def update_cashplan_status(
     cashplan_id: int,
     new_status:  str,
     keterangan:  str = None,
-    denom:       int = None,
+    denom:       str = None,
 ) -> dict:
     now = datetime.now()
 
