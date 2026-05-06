@@ -61,7 +61,13 @@ def build_predictions(df: pd.DataFrame) -> list:
         avg6j   = max(float(row.get('Avg Penarikan 6j',  0) or 0), 0)
         avg24j  = max(float(row.get('Avg Penarikan 24j', 0) or 0), 0)
         avg72j  = max(float(row.get('Avg Penarikan 72j', 0) or 0), 0)
-        is_sepi = int(row.get('Is_ATM_Sepi', 0) or 0)
+        avg_cashout_raw = max(avg6j, avg24j, avg72j)
+        limit_raw = float(row.get('Limit', 0) or 0)
+
+        if limit_raw > 0 and avg_cashout_raw > 0:
+            is_sepi = 1 if (avg_cashout_raw / limit_raw) < 0.005 else 0
+        else:
+            is_sepi = 0
 
         # ── Cash out analytics ──────────────────────────────────────────────
         data_atm  = df[df['ID ATM'] == atm]

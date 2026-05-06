@@ -52,7 +52,7 @@ def _sanitize(obj):
 
 
 app = FastAPI(
-    title="Smart ATM Dashboard API",
+    title="Sipras",
     description="Backend monitoring & prediksi saldo ATM BRK Syariah — V7",
     version="7.0.0",
 )
@@ -273,6 +273,47 @@ def master_vs_monitoring():
             }
             for r in pred_rows if r["id_atm"] not in master_ids
         ]
+        with get_conn() as conn:
+            cur = conn.cursor(dictionary=True)
+            matched_ids_list = list(master_ids & pred_ids)
+            if matched_ids_list:
+                placeholders = ",".join(["%s"] * len(matched_ids_list))
+                cur.execute(f"""
+                    SELECT
+                        p.id_atm,
+                        m.lokasi_atm,
+                        m.wilayah,
+                        m.merk_atm,
+                        m.denom_options,
+                        m.`limit`,
+                        p.saldo,
+                        p.pct_saldo,
+                        p.status,
+                        p.last_update
+                    FROM predictions p
+                    INNER JOIN atm_masters m ON p.id_atm = m.id_atm
+                    WHERE p.id_atm IN ({placeholders})
+                    ORDER BY p.skor_urgensi DESC
+                """, matched_ids_list)
+                matched_rows = cur.fetchall()
+            else:
+                matched_rows = []
+        
+        matched_detail = [
+            {
+                "id_atm":        r["id_atm"],
+                "lokasi_atm":    r["lokasi_atm"],
+                "wilayah":       r["wilayah"],
+                "merk_atm":      r["merk_atm"],
+                "denom_options": r["denom_options"],
+                "limit":         r["limit"],
+                "saldo":         r["saldo"],
+                "pct_saldo":     r["pct_saldo"],
+                "status":        r["status"],
+                "last_update":   str(r["last_update"]) if r["last_update"] else None,
+            }
+            for r in matched_rows
+        ]
 
         # ATM yang normal (ada di keduanya)
         matched = len(master_ids & pred_ids)
@@ -292,14 +333,15 @@ def master_vs_monitoring():
         return {
             "summary": {
                 "total_master_ssi": len(master_ids),
-                "total_monitored": len(pred_ids),
-                "matched": matched,
-                "not_monitored": len(not_monitored),
-                "not_in_master": len(not_in_master),
-                "coverage_pct": round(matched / max(len(master_ids), 1) * 100, 1),
+                "total_monitored":  len(pred_ids),
+                "matched":          matched,
+                "not_monitored":    len(not_monitored),
+                "not_in_master":    len(not_in_master),
+                "coverage_pct":     round(matched / max(len(master_ids), 1) * 100, 1),
             },
-            "not_monitored": not_monitored,
-            "not_in_master": not_in_master,
+            "not_monitored":   not_monitored,
+            "not_in_master":   not_in_master,
+            "matched_detail":  matched_detail,   # ← TAMBAH INI
             "wilayah_breakdown": [
                 {"wilayah": w, **v} for w, v in wilayah_breakdown.items()
             ],
@@ -753,15 +795,13 @@ def _sync_notif_from_predictions(predictions: list):
         atm_id = p.get("id_atm", "")
         pct    = float(p.get("pct_saldo", 100) or 100)
 
+        # Skip kalau sudah ada di antrian cashplan
         if atm_id in pending_ids:
             continue
 
-        if pct <= AUTO_CASHPLAN_PCT * 100:
-            try:
-                add_to_cashplan({**p, "added_by": "system"})
-            except Exception:
-                pass
-        elif pct <= TRIGGER_CASHPLAN_PCT * 100:
+        # SEMUA kondisi → masuk notif dulu, user yang putuskan
+        # Bedanya hanya status_awal yang berbeda (BONGKAR vs AWAS)
+        if pct <= TRIGGER_CASHPLAN_PCT * 100:
             try:
                 upsert_notif_cashplan(p)
             except Exception:
@@ -1045,22 +1085,36 @@ def get_wilayah():
         from database import get_conn
         with get_conn() as conn:
             cur = conn.cursor(dictionary=True)
-            cur.execute("SELECT id_atm,lokasi,tipe,denom_options,pct_saldo,status,skor_urgensi,atm_sepi,wilayah FROM predictions ORDER BY skor_urgensi DESC")
+            # JOIN ke atm_masters untuk ambil wilayah
+            cur.execute("""
+                SELECT
+                    p.id_atm,
+                    p.pct_saldo,
+                    p.status,
+                    p.skor_urgensi,
+                    p.atm_sepi,
+                    COALESCE(m.lokasi_atm, '-')        AS lokasi,
+                    COALESCE(m.wilayah, 'Unknown')     AS wilayah,
+                    COALESCE(m.denom_options, '100000') AS denom_options,
+                    UPPER(LEFT(p.id_atm, 3))            AS tipe
+                FROM predictions p
+                LEFT JOIN atm_masters m ON p.id_atm = m.id_atm
+                ORDER BY p.skor_urgensi DESC
+            """)
             rows = cur.fetchall()
+
         result = {}
         for d in rows:
             d["atm_sepi"] = bool(d.get("atm_sepi", 0))
-            result.setdefault(d["wilayah"], []).append(d)
-        return _sanitize({"wilayah_list": list(result.keys()), "data": result})
-    except Exception:
-        cache = load_cache()
-        if cache is None:
-            raise HTTPException(404, "Belum ada prediksi.")
-        result = {}
-        for d in cache["data"]:
-            w = d.get("wilayah", "Unknown")
-            result.setdefault(w, []).append({k: d[k] for k in ["id_atm","lokasi","tipe","denom_options","pct_saldo","status","skor_urgensi","atm_sepi"] if k in d})
-        return _sanitize({"wilayah_list": list(result.keys()), "data": result})
+            w = d.get("wilayah") or "Unknown"
+            result.setdefault(w, []).append(d)
+
+        return _sanitize({
+            "wilayah_list": sorted(result.keys()),
+            "data": result
+        })
+    except Exception as e:
+        raise HTTPException(500, str(e))
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -1158,7 +1212,9 @@ def api_approve_notif(notif_id: int):
     except ValueError as e:
         raise HTTPException(404, str(e))
     except Exception as e:
-        raise HTTPException(500, str(e))
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(500, f"Approve gagal: {str(e)}")
 
 
 @app.post("/api/notif-cashplan/{notif_id}/dismiss", tags=["Notif"])
@@ -1177,10 +1233,7 @@ def api_dismiss_all_notif():
     try:
         from database import get_conn
         with get_conn() as conn:
-            conn.cursor().execute(
-                "UPDATE notif_cashplan SET status_notif='DISMISSED', decided_at=%s WHERE status_notif='PENDING'",
-                (datetime.now(),)
-            )
+            conn.cursor().execute("DELETE FROM notif_cashplan WHERE status_notif='PENDING'")
         return {"message": "Semua notif berhasil di-dismiss"}
     except Exception as e:
         raise HTTPException(500, str(e))

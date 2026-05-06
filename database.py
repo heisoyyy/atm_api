@@ -220,9 +220,13 @@ def _fmt_pred(r: dict) -> dict:
     for f in ["generated_at", "last_update", "tgl_awas", "tgl_habis", "tgl_isi"]:
         if r.get(f):
             r[f] = str(r[f])
-    r["atm_sepi"] = bool(r.get("atm_sepi", 0))
-    r["saldo"]    = int(r["saldo"])  if r.get("saldo")  is not None else 0
-    r["limit"]    = int(r["limit"])  if r.get("limit")  is not None else 0
+    r["saldo"] = int(r["saldo"]) if r.get("saldo") is not None else 0
+    r["limit"] = int(r["limit"]) if r.get("limit") is not None else 0
+    
+    # FIX: pastikan integer dulu sebelum bool
+    atm_sepi_raw = r.get("atm_sepi", 0)
+    r["atm_sepi"] = bool(int(atm_sepi_raw)) if atm_sepi_raw is not None else False
+    
     return r
 
 
@@ -672,20 +676,13 @@ def update_cashplan_status(
 
 
 def remove_cashplan_only(cashplan_id: int):
-    """Hapus dari antrian cashplan (tombol ✕). TIDAK insert ke rekap."""
+    """Hapus permanen dari antrian cashplan. TIDAK masuk rekap."""
     with get_conn() as conn:
         cur = conn.cursor(dictionary=True)
         cur.execute("SELECT id FROM cashplan WHERE id=%s", (cashplan_id,))
         if not cur.fetchone():
             raise ValueError(f"Cashplan id {cashplan_id} tidak ditemukan")
-
-    with get_conn() as conn:
-        conn.cursor().execute(
-            """UPDATE cashplan
-               SET status_cashplan='REMOVED', status_done='REMOVED', removed_at=%s
-               WHERE id=%s""",
-            (datetime.now(), cashplan_id)
-        )
+        conn.cursor().execute("DELETE FROM cashplan WHERE id=%s", (cashplan_id,))
 
 
 # ══════════════════════════════════════════════════════════════
@@ -775,19 +772,37 @@ def get_notif_pending() -> list:
 
 
 def approve_notif(notif_id: int) -> int:
-    """User approve notif → masuk cashplan dengan added_by='notif'."""
+    """Approve notif → insert ke cashplan → DELETE notif (temporary)."""
+    _LEFT_JOIN = """
+        SELECT n.*,
+            COALESCE(m.denom_options, '100000') AS denom_options,
+            COALESCE(m.`limit`, 0)              AS `limit`
+        FROM notif_cashplan n
+        LEFT JOIN atm_masters m ON n.id_atm = m.id_atm
+    """
     with get_conn() as conn:
         cur = conn.cursor(dictionary=True)
-        cur.execute(
-            f"{_NOTIF_JOIN_SELECT} WHERE n.id=%s",
-            (notif_id,)
-        )
+        cur.execute(f"{_LEFT_JOIN} WHERE n.id=%s", (notif_id,))
         item = cur.fetchone()
 
     if not item:
-        raise ValueError(f"Notif id {notif_id} tidak ditemukan")
+        # Sudah dihapus sebelumnya (idempotent) — cek apakah cashplan sudah ada
+        return -1
 
-    # Tidak pass denom → add_to_cashplan akan ambil dari master otomatis
+    # Jika sudah pernah diproses tapi belum terhapus
+    if item.get("status_notif") != "PENDING":
+        with get_conn() as conn:
+            cur = conn.cursor(dictionary=True)
+            cur.execute(
+                "SELECT id FROM cashplan WHERE id_atm=%s AND status_cashplan='PENDING'",
+                (item["id_atm"],)
+            )
+            existing = cur.fetchone()
+            # Hapus notif yang terlanjur tidak terhapus
+            conn.cursor().execute("DELETE FROM notif_cashplan WHERE id=%s", (notif_id,))
+        return existing["id"] if existing else -1
+
+    # Insert ke cashplan
     cp_id = add_to_cashplan({
         "id_atm":       item["id_atm"],
         "saldo":        item.get("saldo", 0),
@@ -798,26 +813,21 @@ def approve_notif(notif_id: int) -> int:
         "added_by":     "notif",
     })
 
+    # DELETE notif — bukan update status, langsung hapus
     with get_conn() as conn:
-        conn.cursor().execute(
-            "UPDATE notif_cashplan SET status_notif='APPROVED', decided_at=%s WHERE id=%s",
-            (datetime.now(), notif_id)
-        )
+        conn.cursor().execute("DELETE FROM notif_cashplan WHERE id=%s", (notif_id,))
+
     return cp_id
 
 
 def dismiss_notif(notif_id: int):
+    """Dismiss notif → DELETE permanen (temporary data)."""
     with get_conn() as conn:
         cur = conn.cursor(dictionary=True)
         cur.execute("SELECT id FROM notif_cashplan WHERE id=%s", (notif_id,))
         if not cur.fetchone():
             raise ValueError(f"Notif id {notif_id} tidak ditemukan")
-
-    with get_conn() as conn:
-        conn.cursor().execute(
-            "UPDATE notif_cashplan SET status_notif='DISMISSED', decided_at=%s WHERE id=%s",
-            (datetime.now(), notif_id)
-        )
+        conn.cursor().execute("DELETE FROM notif_cashplan WHERE id=%s", (notif_id,))
 
 
 # ══════════════════════════════════════════════════════════════
