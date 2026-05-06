@@ -11,6 +11,8 @@ from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException, Q
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
+from fastapi import Depends
+
 
 from config import (
     PROCESSED_CSV, PRED_CACHE, MODEL_PATH, FITUR_PATH, WILAYAH_LIST,
@@ -19,6 +21,7 @@ from config import (
 from processing import process_dataframe
 from predictor import build_predictions, save_cache, load_cache
 from trainer import train
+
 from database import (
     upsert_predictions,
     get_predictions_from_db,
@@ -37,7 +40,11 @@ from database import (
     approve_notif,
     dismiss_notif,
 )
-
+from auth import (
+    LoginRequest, RegisterRequest,
+    login_user, register_user,
+    get_current_user, require_admin,
+)
 
 def _sanitize(obj):
     if isinstance(obj, float):
@@ -102,6 +109,66 @@ def health_db():
     except Exception as e:
         return JSONResponse(status_code=503, content={"status": "error", "message": str(e)})
 
+
+# ════════════════════════════════════════════════════════════════════════════════
+#  AUTH
+# ════════════════════════════════════════════════════════════════════════════════
+
+@app.post("/api/auth/login", tags=["Auth"])
+def api_login(req: LoginRequest):
+    return login_user(req)
+
+
+@app.post("/api/auth/register", tags=["Auth"])
+def api_register(req: RegisterRequest):
+    """
+    Self-register: hanya bisa buat role 'viewer' atau 'operator'.
+    Untuk buat admin, gunakan endpoint /api/auth/register-by-admin.
+    """
+    return register_user(req, created_by=None)
+
+
+@app.post("/api/auth/register-by-admin", tags=["Auth"])
+def api_register_by_admin(req: RegisterRequest, admin=Depends(require_admin)):
+    """Admin bisa buat akun dengan role apapun termasuk 'admin'."""
+    return register_user(req, created_by=admin)
+
+
+@app.get("/api/auth/me", tags=["Auth"])
+def api_me(user=Depends(get_current_user)):
+    return user
+
+
+@app.get("/api/auth/users", tags=["Auth"])
+def api_list_users(admin=Depends(require_admin)):
+    with get_conn() as conn:
+        cur = conn.cursor(dictionary=True)
+        cur.execute(
+            "SELECT id, username, email, full_name, role, wilayah, is_active, "
+            "created_at, last_login FROM users ORDER BY created_at DESC"
+        )
+        rows = cur.fetchall()
+    for r in rows:
+        if r.get("created_at"): r["created_at"] = r["created_at"].isoformat()
+        if r.get("last_login"):  r["last_login"]  = r["last_login"].isoformat()
+    return {"total": len(rows), "data": rows}
+
+
+@app.patch("/api/auth/users/{user_id}/toggle", tags=["Auth"])
+def api_toggle_user(user_id: int, admin=Depends(require_admin)):
+    with get_conn() as conn:
+        cur = conn.cursor(dictionary=True)
+        cur.execute("SELECT id, is_active, role FROM users WHERE id=%s", (user_id,))
+        u = cur.fetchone()
+        if not u:
+            raise HTTPException(404, "User tidak ditemukan.")
+        if u["role"] == "admin" and admin["id"] == user_id:
+            raise HTTPException(400, "Tidak bisa nonaktifkan diri sendiri.")
+        new_status = 0 if u["is_active"] else 1
+        conn.cursor().execute(
+            "UPDATE users SET is_active=%s WHERE id=%s", (new_status, user_id)
+        )
+    return {"user_id": user_id, "is_active": bool(new_status)}
 
 # ════════════════════════════════════════════════════════════════════════════════
 #  STATUS
