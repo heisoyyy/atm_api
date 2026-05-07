@@ -208,6 +208,9 @@ def api_list_pending_users(admin=Depends(require_admin)):
 # ════════════════════════════════════════════════════════════════════════════════
 #  Change Password
 # ════════════════════════════════════════════════════════════════════════════════
+class ResetPasswordRequest(BaseModel):
+    new_password: str
+
 
 @app.patch("/api/auth/users/{user_id}/reset-password", tags=["Auth"])
 def api_reset_password(user_id: int, body: ResetPasswordRequest, admin=Depends(require_admin)):
@@ -1372,8 +1375,7 @@ class RekapUpdateRequest(BaseModel):
     jam_cash_out: Optional[str] = None
     denom:        Optional[int] = None
     
-class ResetPasswordRequest(BaseModel):
-    new_password: str
+
 
 
 @app.get("/api/rekap-replacement", tags=["Rekap"])
