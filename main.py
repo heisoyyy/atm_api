@@ -23,6 +23,7 @@ from predictor import build_predictions, save_cache, load_cache
 from trainer import train
 
 from database import (
+    get_conn,  
     upsert_predictions,
     get_predictions_from_db,
     bulk_insert_history,
@@ -141,21 +142,25 @@ def api_me(user=Depends(get_current_user)):
 
 @app.get("/api/auth/users", tags=["Auth"])
 def api_list_users(admin=Depends(require_admin)):
+    from database import get_conn
     with get_conn() as conn:
         cur = conn.cursor(dictionary=True)
         cur.execute(
-            "SELECT id, username, email, full_name, role, wilayah, is_active, "
-            "created_at, last_login FROM users ORDER BY created_at DESC"
+            "SELECT id, username, email, full_name, role, wilayah, "
+            "is_active, is_approved, created_at, last_login "   # ← tambah is_approved
+            "FROM users ORDER BY is_approved ASC, created_at DESC"  # pending duluan
         )
         rows = cur.fetchall()
     for r in rows:
         if r.get("created_at"): r["created_at"] = r["created_at"].isoformat()
         if r.get("last_login"):  r["last_login"]  = r["last_login"].isoformat()
+        r["is_approved"] = bool(r.get("is_approved", 0))
     return {"total": len(rows), "data": rows}
 
 
 @app.patch("/api/auth/users/{user_id}/toggle", tags=["Auth"])
 def api_toggle_user(user_id: int, admin=Depends(require_admin)):
+    from database import get_conn          # ← tambahkan baris ini
     with get_conn() as conn:
         cur = conn.cursor(dictionary=True)
         cur.execute("SELECT id, is_active, role FROM users WHERE id=%s", (user_id,))
@@ -169,6 +174,57 @@ def api_toggle_user(user_id: int, admin=Depends(require_admin)):
             "UPDATE users SET is_active=%s WHERE id=%s", (new_status, user_id)
         )
     return {"user_id": user_id, "is_active": bool(new_status)}
+
+@app.patch("/api/auth/users/{user_id}/approve", tags=["Auth"])
+def api_approve_user(user_id: int, admin=Depends(require_admin)):
+    from database import get_conn
+    with get_conn() as conn:
+        cur = conn.cursor(dictionary=True)
+        cur.execute("SELECT id, username, is_approved FROM users WHERE id=%s", (user_id,))
+        u = cur.fetchone()
+        if not u:
+            raise HTTPException(404, "User tidak ditemukan.")
+        conn.cursor().execute(
+            "UPDATE users SET is_approved=1 WHERE id=%s", (user_id,)
+        )
+    return {"message": f"User '{u['username']}' berhasil diverifikasi", "user_id": user_id}
+
+
+@app.get("/api/auth/users/pending", tags=["Auth"])
+def api_list_pending_users(admin=Depends(require_admin)):
+    """List user yang belum diapprove (is_approved=0)"""
+    from database import get_conn
+    with get_conn() as conn:
+        cur = conn.cursor(dictionary=True)
+        cur.execute(
+            "SELECT id, username, email, full_name, role, wilayah, created_at "
+            "FROM users WHERE is_approved=0 ORDER BY created_at DESC"
+        )
+        rows = cur.fetchall()
+    for r in rows:
+        if r.get("created_at"): r["created_at"] = r["created_at"].isoformat()
+    return {"total": len(rows), "data": rows}
+
+# ════════════════════════════════════════════════════════════════════════════════
+#  Change Password
+# ════════════════════════════════════════════════════════════════════════════════
+
+@app.patch("/api/auth/users/{user_id}/reset-password", tags=["Auth"])
+def api_reset_password(user_id: int, body: ResetPasswordRequest, admin=Depends(require_admin)):
+    if len(body.new_password) < 6:
+        raise HTTPException(400, "Password minimal 6 karakter.")
+    from auth import hash_password
+    from database import get_conn
+    with get_conn() as conn:
+        cur = conn.cursor(dictionary=True)
+        cur.execute("SELECT id FROM users WHERE id=%s", (user_id,))
+        if not cur.fetchone():
+            raise HTTPException(404, "User tidak ditemukan.")
+        conn.cursor().execute(
+            "UPDATE users SET password_hash=%s WHERE id=%s",
+            (hash_password(body.new_password), user_id)
+        )
+    return {"message": "Password berhasil direset", "user_id": user_id}
 
 # ════════════════════════════════════════════════════════════════════════════════
 #  STATUS
@@ -1315,6 +1371,9 @@ class RekapUpdateRequest(BaseModel):
     jam_cash_in:  Optional[str] = None
     jam_cash_out: Optional[str] = None
     denom:        Optional[int] = None
+    
+class ResetPasswordRequest(BaseModel):
+    new_password: str
 
 
 @app.get("/api/rekap-replacement", tags=["Rekap"])

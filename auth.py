@@ -138,8 +138,15 @@ def login_user(req: LoginRequest) -> TokenResponse:
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Username atau password salah.",
         )
+    
+    # ── CEK APPROVAL ──────────────────────────────────────────
+    if not user.get("is_approved", 0):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Akun belum diverifikasi admin. Silakan tunggu persetujuan.",
+        )
+    # ──────────────────────────────────────────────────────────
 
-    # Update last_login
     with get_conn() as conn:
         conn.cursor().execute(
             "UPDATE users SET last_login=%s WHERE id=%s",
@@ -162,18 +169,11 @@ def login_user(req: LoginRequest) -> TokenResponse:
 
 
 def register_user(req: RegisterRequest, created_by: dict = None) -> dict:
-    """
-    Register user baru.
-    - Role 'admin' hanya bisa dibuat oleh admin.
-    - Role 'operator'/'viewer' bisa dibuat oleh admin atau self-register.
-    """
     if created_by is None and req.role == "admin":
         raise HTTPException(400, "Tidak bisa self-register sebagai admin.")
-
     if created_by and created_by["role"] != "admin" and req.role == "admin":
         raise HTTPException(403, "Hanya admin yang bisa membuat akun admin.")
 
-    # Cek duplikat
     with get_conn() as conn:
         cur = conn.cursor(dictionary=True)
         cur.execute(
@@ -184,11 +184,17 @@ def register_user(req: RegisterRequest, created_by: dict = None) -> dict:
             raise HTTPException(400, "Username atau email sudah terdaftar.")
 
     hashed = hash_password(req.password)
+    
+    # Jika dibuat oleh admin → langsung approved
+    # Jika self-register → perlu approval
+    is_approved = 1 if created_by else 0
+
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute(
-            """INSERT INTO users (username, email, password_hash, full_name, role, wilayah)
-               VALUES (%s, %s, %s, %s, %s, %s)""",
+            """INSERT INTO users 
+               (username, email, password_hash, full_name, role, wilayah, is_approved)
+               VALUES (%s, %s, %s, %s, %s, %s, %s)""",
             (
                 req.username.strip(),
                 req.email.strip(),
@@ -196,13 +202,15 @@ def register_user(req: RegisterRequest, created_by: dict = None) -> dict:
                 req.full_name,
                 req.role,
                 req.wilayah,
+                is_approved,
             )
         )
         new_id = cur.lastrowid
 
     return {
-        "message":  "Registrasi berhasil",
-        "user_id":  new_id,
-        "username": req.username,
-        "role":     req.role,
+        "message":     "Registrasi berhasil. Menunggu verifikasi admin." if not created_by else "User berhasil dibuat.",
+        "user_id":     new_id,
+        "username":    req.username,
+        "role":        req.role,
+        "is_approved": bool(is_approved),
     }
