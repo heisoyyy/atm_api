@@ -15,3 +15,30 @@ Endpoints:
   GET  /api/wilayah             list wilayah + statistik
   DELETE /api/data              hapus semua data & model (reset)
 """
+-- ============================================================
+-- 8. users — Auth sistem login SIPRAS
+-- ============================================================
+CREATE TABLE IF NOT EXISTS users (
+    id           INT           AUTO_INCREMENT PRIMARY KEY,
+    username     VARCHAR(50)   NOT NULL,
+    email        VARCHAR(100)  NOT NULL,
+    password_hash VARCHAR(255) NOT NULL,
+    full_name    VARCHAR(100)  DEFAULT NULL,
+    role         VARCHAR(20)   NOT NULL DEFAULT 'viewer',
+    -- role: 'admin' | 'operator' | 'viewer'
+    wilayah      VARCHAR(50)   DEFAULT NULL,
+    -- NULL = akses semua wilayah
+    is_active    TINYINT(1)    NOT NULL DEFAULT 1,
+    created_at   DATETIME      DEFAULT CURRENT_TIMESTAMP,
+    last_login   DATETIME      DEFAULT NULL,
+
+    UNIQUE KEY uq_username (username),
+    UNIQUE KEY uq_email    (email),
+    INDEX idx_role         (role),
+    INDEX idx_active       (is_active)
+) ENGINE=InnoDB;
+
+ALTER TABLE users ADD COLUMN is_approved TINYINT(1) NOT NULL DEFAULT 0 AFTER is_active;
+
+-- User admin yang sudah ada, set approved langsung
+-- UPDATE users SET is_approved = 1 WHERE role = 'admin';

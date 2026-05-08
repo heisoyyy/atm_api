@@ -2,7 +2,7 @@ from passlib.context import CryptContext
 from database import get_conn
 
 pwd = CryptContext(schemes=["bcrypt"], deprecated="auto")
-hashed = pwd.hash("admin123")
+hashed = pwd.hash("adminbrks2026")
 
 with get_conn() as conn:
     conn.cursor().execute("""
