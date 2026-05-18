@@ -7,7 +7,7 @@ from datetime import datetime
 from typing import Optional
 import traceback
 import pandas as pd
-from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException, Query
+from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
@@ -23,7 +23,7 @@ from predictor import build_predictions, save_cache, load_cache
 from trainer import train
 
 from database import (
-    get_conn,  
+    get_conn,
     upsert_predictions,
     get_predictions_from_db,
     bulk_insert_history,
@@ -40,12 +40,15 @@ from database import (
     get_notif_pending,
     approve_notif,
     dismiss_notif,
+    log_activity,
+    get_activity_log,
 )
 from auth import (
     LoginRequest, RegisterRequest,
     login_user, register_user,
     get_current_user, require_admin,
 )
+
 
 def _sanitize(obj):
     if isinstance(obj, float):
@@ -59,10 +62,21 @@ def _sanitize(obj):
     return obj
 
 
+def _get_ip(request: Request) -> str:
+    """Ambil IP address dari request, support reverse proxy."""
+    forwarded = request.headers.get("X-Forwarded-For")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    real_ip = request.headers.get("X-Real-IP")
+    if real_ip:
+        return real_ip.strip()
+    return request.client.host if request.client else "unknown"
+
+
 app = FastAPI(
     title="Sipras",
-    description="Backend monitoring & prediksi saldo ATM BRK Syariah — V7",
-    version="7.0.0",
+    description="Backend monitoring & prediksi saldo ATM BRK Syariah — V8",
+    version="8.0.0",
 )
 
 app.add_middleware(
@@ -75,6 +89,8 @@ app.add_middleware(
 
 from atm_masters_routes import router as masters_router
 app.include_router(masters_router)
+from activity_log_routes import router as activity_log_router
+app.include_router(activity_log_router)
 
 _train_state = {
     "status":       "idle",
@@ -93,7 +109,7 @@ _train_state = {
 def root():
     return {
         "service":    "Smart ATM Dashboard API",
-        "version":    "7.0.0",
+        "version":    "8.0.0",
         "status":     "running",
         "time":       datetime.now().isoformat(),
     }
@@ -116,23 +132,59 @@ def health_db():
 # ════════════════════════════════════════════════════════════════════════════════
 
 @app.post("/api/auth/login", tags=["Auth"])
-def api_login(req: LoginRequest):
-    return login_user(req)
+def api_login(req: LoginRequest, request: Request):
+    result = login_user(req)
+    # Log login berhasil
+    try:
+        user_info = result.get("user", {})
+        log_activity(
+            action="LOGIN",
+            user_id=user_info.get("id"),
+            username=user_info.get("username"),
+            role=user_info.get("role"),
+            entity="auth",
+            detail={"method": "password"},
+            ip_address=_get_ip(request),
+        )
+    except Exception:
+        pass
+    return result
 
 
 @app.post("/api/auth/register", tags=["Auth"])
-def api_register(req: RegisterRequest):
+def api_register(req: RegisterRequest, request: Request):
     """
     Self-register: hanya bisa buat role 'viewer' atau 'operator'.
     Untuk buat admin, gunakan endpoint /api/auth/register-by-admin.
     """
-    return register_user(req, created_by=None)
+    result = register_user(req, created_by=None)
+    try:
+        log_activity(
+            action="USER_REGISTER",
+            username=req.username,
+            entity="user",
+            detail={"role": req.role, "email": req.email},
+            ip_address=_get_ip(request),
+        )
+    except Exception:
+        pass
+    return result
 
 
 @app.post("/api/auth/register-by-admin", tags=["Auth"])
-def api_register_by_admin(req: RegisterRequest, admin=Depends(require_admin)):
+def api_register_by_admin(req: RegisterRequest, request: Request, admin=Depends(require_admin)):
     """Admin bisa buat akun dengan role apapun termasuk 'admin'."""
-    return register_user(req, created_by=admin)
+    result = register_user(req, created_by=admin)
+    log_activity(
+        action="USER_CREATE",
+        user_id=admin["id"],
+        username=admin["username"],
+        role=admin["role"],
+        entity="user",
+        detail={"new_user": req.username, "new_role": req.role},
+        ip_address=_get_ip(request),
+    )
+    return result
 
 
 @app.get("/api/auth/me", tags=["Auth"])
@@ -147,8 +199,8 @@ def api_list_users(admin=Depends(require_admin)):
         cur = conn.cursor(dictionary=True)
         cur.execute(
             "SELECT id, username, email, full_name, role, wilayah, "
-            "is_active, is_approved, created_at, last_login "   # ← tambah is_approved
-            "FROM users ORDER BY is_approved ASC, created_at DESC"  # pending duluan
+            "is_active, is_approved, created_at, last_login "
+            "FROM users ORDER BY is_approved ASC, created_at DESC"
         )
         rows = cur.fetchall()
     for r in rows:
@@ -159,11 +211,11 @@ def api_list_users(admin=Depends(require_admin)):
 
 
 @app.patch("/api/auth/users/{user_id}/toggle", tags=["Auth"])
-def api_toggle_user(user_id: int, admin=Depends(require_admin)):
-    from database import get_conn          # ← tambahkan baris ini
+def api_toggle_user(user_id: int, request: Request, admin=Depends(require_admin)):
+    from database import get_conn
     with get_conn() as conn:
         cur = conn.cursor(dictionary=True)
-        cur.execute("SELECT id, is_active, role FROM users WHERE id=%s", (user_id,))
+        cur.execute("SELECT id, is_active, role, username FROM users WHERE id=%s", (user_id,))
         u = cur.fetchone()
         if not u:
             raise HTTPException(404, "User tidak ditemukan.")
@@ -173,10 +225,21 @@ def api_toggle_user(user_id: int, admin=Depends(require_admin)):
         conn.cursor().execute(
             "UPDATE users SET is_active=%s WHERE id=%s", (new_status, user_id)
         )
+    log_activity(
+        action="USER_TOGGLE",
+        user_id=admin["id"],
+        username=admin["username"],
+        role=admin["role"],
+        entity="user",
+        entity_id=user_id,
+        detail={"target_user": u["username"], "new_status": "active" if new_status else "inactive"},
+        ip_address=_get_ip(request),
+    )
     return {"user_id": user_id, "is_active": bool(new_status)}
 
+
 @app.patch("/api/auth/users/{user_id}/approve", tags=["Auth"])
-def api_approve_user(user_id: int, admin=Depends(require_admin)):
+def api_approve_user(user_id: int, request: Request, admin=Depends(require_admin)):
     from database import get_conn
     with get_conn() as conn:
         cur = conn.cursor(dictionary=True)
@@ -187,6 +250,16 @@ def api_approve_user(user_id: int, admin=Depends(require_admin)):
         conn.cursor().execute(
             "UPDATE users SET is_approved=1 WHERE id=%s", (user_id,)
         )
+    log_activity(
+        action="USER_APPROVE",
+        user_id=admin["id"],
+        username=admin["username"],
+        role=admin["role"],
+        entity="user",
+        entity_id=user_id,
+        detail={"approved_user": u["username"]},
+        ip_address=_get_ip(request),
+    )
     return {"message": f"User '{u['username']}' berhasil diverifikasi", "user_id": user_id}
 
 
@@ -205,29 +278,43 @@ def api_list_pending_users(admin=Depends(require_admin)):
         if r.get("created_at"): r["created_at"] = r["created_at"].isoformat()
     return {"total": len(rows), "data": rows}
 
+
 # ════════════════════════════════════════════════════════════════════════════════
 #  Change Password
 # ════════════════════════════════════════════════════════════════════════════════
+
 class ResetPasswordRequest(BaseModel):
     new_password: str
 
 
 @app.patch("/api/auth/users/{user_id}/reset-password", tags=["Auth"])
-def api_reset_password(user_id: int, body: ResetPasswordRequest, admin=Depends(require_admin)):
+def api_reset_password(user_id: int, body: ResetPasswordRequest, request: Request, admin=Depends(require_admin)):
     if len(body.new_password) < 6:
         raise HTTPException(400, "Password minimal 6 karakter.")
     from auth import hash_password
     from database import get_conn
     with get_conn() as conn:
         cur = conn.cursor(dictionary=True)
-        cur.execute("SELECT id FROM users WHERE id=%s", (user_id,))
-        if not cur.fetchone():
+        cur.execute("SELECT id, username FROM users WHERE id=%s", (user_id,))
+        u = cur.fetchone()
+        if not u:
             raise HTTPException(404, "User tidak ditemukan.")
         conn.cursor().execute(
             "UPDATE users SET password_hash=%s WHERE id=%s",
             (hash_password(body.new_password), user_id)
         )
+    log_activity(
+        action="USER_RESET_PW",
+        user_id=admin["id"],
+        username=admin["username"],
+        role=admin["role"],
+        entity="user",
+        entity_id=user_id,
+        detail={"target_user": u["username"]},
+        ip_address=_get_ip(request),
+    )
     return {"message": "Password berhasil direset", "user_id": user_id}
+
 
 # ════════════════════════════════════════════════════════════════════════════════
 #  STATUS
@@ -246,7 +333,7 @@ def get_status():
         "model_path":   str(MODEL_PATH) if has_model else None,
         "train_status": _train_state["status"],
         "last_trained": _train_state["last_trained"],
-        "version":      "7.0.0",
+        "version":      "8.0.0",
         "config": {
             "AUTO_CASHPLAN_PCT":    AUTO_CASHPLAN_PCT,
             "TRIGGER_CASHPLAN_PCT": TRIGGER_CASHPLAN_PCT,
@@ -308,7 +395,6 @@ def get_status():
                 cur.execute("SELECT COUNT(*) AS cnt FROM notif_cashplan WHERE status_notif='PENDING'")
                 info["notif_pending"] = cur.fetchone()["cnt"]
 
-                # ── Info ATM Master vs Upload ──────────────────────────────
                 cur.execute("SELECT COUNT(*) AS cnt FROM atm_masters WHERE unit_pengisian='SSI'")
                 info["atm_master_ssi_count"] = cur.fetchone()["cnt"]
 
@@ -328,21 +414,15 @@ def get_status():
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-#  ATM MASTER vs MONITORING — endpoint baru untuk dashboard comparison
+#  MASTER VS MONITORING
 # ════════════════════════════════════════════════════════════════════════════════
 
 @app.get("/api/dashboard/master-vs-monitoring", tags=["Dashboard"])
 def master_vs_monitoring():
-    """
-    Perbandingan antara ATM di master (SSI) dan ATM yang termonitor (ada di predictions).
-    Digunakan untuk fitur analisis di Dashboard.
-    """
     try:
         from database import get_conn
         with get_conn() as conn:
             cur = conn.cursor(dictionary=True)
-
-            # Semua ATM SSI di master
             cur.execute("""
                 SELECT id_atm, lokasi_atm, wilayah, denom_options, `limit`, merk_atm
                 FROM atm_masters
@@ -351,27 +431,16 @@ def master_vs_monitoring():
             """)
             master_rows = cur.fetchall()
 
-            # ATM yang ada di predictions (sudah pernah diupload)
             cur.execute("""
                 SELECT id_atm, saldo, pct_saldo, status, last_update
                 FROM predictions
             """)
             pred_rows = cur.fetchall()
 
-            print("DEBUG MASTER ROWS:", len(master_rows))
-            print("DEBUG PRED ROWS:", len(pred_rows))
-
-            # cek contoh isi data pertama
-            if master_rows:
-                print("SAMPLE MASTER:", master_rows[0])
-            if pred_rows:
-                print("SAMPLE PRED:", pred_rows[0])
-
         master_ids = {r["id_atm"] for r in master_rows}
         pred_ids   = {r["id_atm"] for r in pred_rows}
         pred_map   = {r["id_atm"]: r for r in pred_rows}
 
-        # ATM di master tapi belum pernah ada data upload
         not_monitored = [
             {
                 "id_atm":       r["id_atm"],
@@ -385,12 +454,9 @@ def master_vs_monitoring():
             for r in master_rows if r["id_atm"] not in pred_ids
         ]
 
-        # ATM di predictions tapi tidak ada di master SSI
         not_in_master = [
             {
                 "id_atm":     r["id_atm"],
-                "lokasi":     r["lokasi"],
-                "wilayah":    r["wilayah"],
                 "saldo":      r["saldo"],
                 "pct_saldo":  r["pct_saldo"],
                 "status":     r["status"],
@@ -399,6 +465,7 @@ def master_vs_monitoring():
             }
             for r in pred_rows if r["id_atm"] not in master_ids
         ]
+
         with get_conn() as conn:
             cur = conn.cursor(dictionary=True)
             matched_ids_list = list(master_ids & pred_ids)
@@ -406,16 +473,9 @@ def master_vs_monitoring():
                 placeholders = ",".join(["%s"] * len(matched_ids_list))
                 cur.execute(f"""
                     SELECT
-                        p.id_atm,
-                        m.lokasi_atm,
-                        m.wilayah,
-                        m.merk_atm,
-                        m.denom_options,
-                        m.`limit`,
-                        p.saldo,
-                        p.pct_saldo,
-                        p.status,
-                        p.last_update
+                        p.id_atm, m.lokasi_atm, m.wilayah, m.merk_atm,
+                        m.denom_options, m.`limit`, p.saldo, p.pct_saldo,
+                        p.status, p.last_update
                     FROM predictions p
                     INNER JOIN atm_masters m ON p.id_atm = m.id_atm
                     WHERE p.id_atm IN ({placeholders})
@@ -424,7 +484,7 @@ def master_vs_monitoring():
                 matched_rows = cur.fetchall()
             else:
                 matched_rows = []
-        
+
         matched_detail = [
             {
                 "id_atm":        r["id_atm"],
@@ -441,10 +501,8 @@ def master_vs_monitoring():
             for r in matched_rows
         ]
 
-        # ATM yang normal (ada di keduanya)
         matched = len(master_ids & pred_ids)
 
-        # Breakdown per wilayah
         wilayah_breakdown = {}
         for r in master_rows:
             w = r["wilayah"] or "Unknown"
@@ -465,20 +523,17 @@ def master_vs_monitoring():
                 "not_in_master":    len(not_in_master),
                 "coverage_pct":     round(matched / max(len(master_ids), 1) * 100, 1),
             },
-            "not_monitored":   not_monitored,
-            "not_in_master":   not_in_master,
-            "matched_detail":  matched_detail,   # ← TAMBAH INI
+            "not_monitored":     not_monitored,
+            "not_in_master":     not_in_master,
+            "matched_detail":    matched_detail,
             "wilayah_breakdown": [
                 {"wilayah": w, **v} for w, v in wilayah_breakdown.items()
             ],
         }
-    
 
     except Exception as e:
         print("\n=== ERROR master-vs-monitoring ===")
-        print("Error message:", str(e))
         traceback.print_exc()
-        print("=================================\n")
         raise HTTPException(500, str(e))
 
 
@@ -546,7 +601,6 @@ def _read_tabular(zf: zipfile.ZipFile, name: str) -> pd.DataFrame:
 
 
 def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Normalize kolom dari file upload — hanya perlu ID ATM & Sisa Saldo."""
     df = df.copy()
     df.columns = [str(c).strip() for c in df.columns]
     col_rename = {}
@@ -625,50 +679,25 @@ def _parse_zip(zip_bytes: bytes):
     return df_combined.sort_values(["ID ATM", "Tanggal", "Jam"]).reset_index(drop=True), errors
 
 
-# ════════════════════════════════════════════════════════════════════════════════
-#  ENRICH FROM ATM MASTER — INTI PERUBAHAN
-#  Ambil data ATM dari atm_masters (unit_pengisian=SSI),
-#  cocokkan dengan ID ATM dari file upload.
-#  Hanya Sisa Saldo yang diambil dari file.
-# ════════════════════════════════════════════════════════════════════════════════
-
 def _enrich_from_master(df_upload: pd.DataFrame) -> tuple[pd.DataFrame, list, list]:
-    """
-    Input  : df_upload — minimal punya kolom: ID ATM, Sisa Saldo, Tanggal, Jam
-    Output : (df_enriched, warnings, skipped_ids)
-
-    - df_enriched : DataFrame lengkap siap masuk processing
-    - warnings    : list string pesan warning untuk response
-    - skipped_ids : list ID ATM yang tidak ditemukan di master SSI
-    """
     from database import get_conn
 
-    # Ambil semua ATM SSI dari master
     with get_conn() as conn:
         cur = conn.cursor(dictionary=True)
         cur.execute("""
             SELECT
-                id_atm,
-                merk_atm,
-                lokasi_atm,
-                alamat_atm,
-                denom_options,
-                lembar,
-                wilayah,
-                `limit`,
-                nama_vendor
+                id_atm, merk_atm, lokasi_atm, alamat_atm,
+                denom_options, lembar, wilayah, `limit`, nama_vendor
             FROM atm_masters
             WHERE unit_pengisian = 'SSI'
         """)
         master_rows = cur.fetchall()
 
     if not master_rows:
-        raise HTTPException(500, "Tidak ada data ATM Master dengan unit_pengisian='SSI'. Import ATM Master terlebih dahulu.")
+        raise HTTPException(500, "Tidak ada data ATM Master dengan unit_pengisian='SSI'.")
 
-    # Buat dict id_atm → row master (case-insensitive)
     master_map = {r["id_atm"].strip().upper(): r for r in master_rows}
 
-    # Normalize ID ATM dari file upload
     df_upload = df_upload.copy()
     df_upload["ID ATM"] = df_upload["ID ATM"].astype(str).str.strip().str.upper()
     df_upload = df_upload[~df_upload["ID ATM"].isin(["", "NAN", "NONE", "NULL", "ID ATM"])]
@@ -692,28 +721,22 @@ def _enrich_from_master(df_upload: pd.DataFrame) -> tuple[pd.DataFrame, list, li
         raise HTTPException(
             400,
             f"Tidak ada ID ATM dari file yang cocok dengan ATM Master SSI. "
-            f"ID dari file: {upload_ids[:10]}. Pastikan ATM Master sudah diimport."
+            f"ID dari file: {upload_ids[:10]}."
         )
 
-    # Filter hanya ID yang match
     df_matched = df_upload[df_upload["ID ATM"].isin(matched_ids)].copy()
 
-    # Enrich dengan data dari master
     enriched_rows = []
     for _, row in df_matched.iterrows():
-        atm_id  = row["ID ATM"]
-        master  = master_map[atm_id]
+        atm_id = row["ID ATM"]
+        master = master_map[atm_id]
 
-        # Parse limit dari master
         try:
             limit_val = float(str(master["limit"]).replace(",", "").replace(".", "").strip()) if master["limit"] else 0
         except Exception:
             limit_val = 0
 
-        # Wilayah → format untuk Vendor field (dipakai processing._clean_vendor)
         wilayah_raw = master.get("wilayah") or "Unknown"
-
-        # Mapping wilayah → nomor vendor SSI (sesuai format lama)
         wilayah_vendor_map = {
             "Pekanbaru":     "1 - SSI Wilayah Pekanbaru",
             "Batam":         "2 - SSI Wilayah Batam",
@@ -728,7 +751,6 @@ def _enrich_from_master(df_upload: pd.DataFrame) -> tuple[pd.DataFrame, list, li
             "Sisa Saldo": row["Sisa Saldo"],
             "Tanggal":   row.get("Tanggal", datetime.now().strftime("%Y-%m-%d")),
             "Jam":       row.get("Jam", datetime.now().strftime("%H:00")),
-            # Data dari master
             "Merk ATM":  master.get("merk_atm") or "-",
             "Lokasi ATM":master.get("lokasi_atm") or "-",
             "Alamat ATM":master.get("alamat_atm") or "-",
@@ -739,7 +761,6 @@ def _enrich_from_master(df_upload: pd.DataFrame) -> tuple[pd.DataFrame, list, li
         })
 
     df_enriched = pd.DataFrame(enriched_rows)
-
     return df_enriched, warnings, skipped_ids
 
 
@@ -749,19 +770,19 @@ def _enrich_from_master(df_upload: pd.DataFrame) -> tuple[pd.DataFrame, list, li
 
 @app.post("/api/upload", tags=["Data"])
 async def upload_data(
+    request: Request,
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     retrain: bool = Query(True),
+    user=Depends(get_current_user),
 ):
     fname   = file.filename or ""
     content = await file.read()
     parse_warnings = []
     skipped_ids    = []
 
-    # ── 1. Baca file → ambil ID ATM + Sisa Saldo saja ────────────────────────
     if fname.lower().endswith(".zip"):
         df_raw, parse_warnings = _parse_zip(content)
-        # df_raw dari ZIP sudah ada Tanggal & Jam dari nama file
     elif fname.lower().endswith((".xlsx", ".xls", ".xlsm")):
         df_raw = _read_excel_or_csv(content, fname)
         df_raw = _normalize_columns(df_raw)
@@ -779,22 +800,15 @@ async def upload_data(
         if "Jam" not in df_raw.columns:
             df_raw["Jam"] = _now.strftime("%H:00")
     else:
-        raise HTTPException(400, f"Format tidak didukung: {fname}. Gunakan ZIP, XLSX, atau CSV.")
+        raise HTTPException(400, f"Format tidak didukung: {fname}.")
 
     if df_raw.empty:
         raise HTTPException(400, "File kosong atau tidak ada data yang bisa dibaca.")
 
-    # Validasi kolom minimal
     for col in ["ID ATM", "Sisa Saldo"]:
         if col not in df_raw.columns:
-            raise HTTPException(
-                400,
-                f"Kolom wajib '{col}' tidak ditemukan. "
-                f"Kolom yang ada: {list(df_raw.columns)}. "
-                f"File monitoring hanya memerlukan kolom: ID ATM dan Sisa Saldo."
-            )
+            raise HTTPException(400, f"Kolom wajib '{col}' tidak ditemukan.")
 
-    # ── 2. Enrich dari ATM Master ─────────────────────────────────────────────
     try:
         df_new, master_warnings, skipped_ids = _enrich_from_master(df_raw)
         parse_warnings.extend(master_warnings)
@@ -806,7 +820,6 @@ async def upload_data(
     if df_new.empty:
         raise HTTPException(400, "Tidak ada data valid setelah pencocokan dengan ATM Master SSI.")
 
-    # ── 3. Proses data (sama seperti sebelumnya) ──────────────────────────────
     try:
         if PROCESSED_CSV.exists():
             df_old = pd.read_csv(PROCESSED_CSV, low_memory=False)
@@ -817,21 +830,16 @@ async def upload_data(
             if is_old_processed:
                 tanggal_baru = set(df_new["Tanggal"].astype(str).str[:10].unique())
                 raw_cols = ["ID ATM", "Sisa Saldo", "Limit", "Tanggal", "Jam",
-                            "Merk ATM", "Lokasi ATM", "Alamat ATM", "Vendor", "Denom",
-                            "Wilayah"]
+                            "Merk ATM", "Lokasi ATM", "Alamat ATM", "Vendor", "Denom", "Wilayah"]
                 raw_cols_available = [c for c in raw_cols if c in df_old.columns]
                 df_old_raw = df_old[raw_cols_available].copy()
-                df_old_raw = df_old_raw[
-                    ~df_old_raw["Tanggal"].astype(str).str[:10].isin(tanggal_baru)
-                ]
+                df_old_raw = df_old_raw[~df_old_raw["Tanggal"].astype(str).str[:10].isin(tanggal_baru)]
                 df_combined = pd.concat([df_old_raw, df_new], ignore_index=True)
                 df_combined = df_combined.drop_duplicates(subset=["ID ATM", "Tanggal", "Jam"])
                 df_final = process_dataframe(df_combined)
             else:
                 tanggal_baru = set(df_new["Tanggal"].astype(str).str[:10].unique())
-                df_old = df_old[
-                    ~df_old["Tanggal"].astype(str).str[:10].isin(tanggal_baru)
-                ]
+                df_old = df_old[~df_old["Tanggal"].astype(str).str[:10].isin(tanggal_baru)]
                 df_combined = pd.concat([df_old, df_new], ignore_index=True)
                 df_combined = df_combined.drop_duplicates(subset=["ID ATM", "Tanggal", "Jam"])
                 df_final = process_dataframe(df_combined)
@@ -887,21 +895,38 @@ async def upload_data(
         parse_warnings.append(f"[Log Warning] {str(e)}")
 
     resp = {
-        "message":      "Upload berhasil",
-        "version":      "V7",
-        "format":       "ZIP" if fname.lower().endswith(".zip") else "Excel/CSV",
-        "total_file":   int(df_raw["ID ATM"].nunique()) if "ID ATM" in df_raw.columns else 0,
-        "matched":      int(df_new["ID ATM"].nunique()) if "ID ATM" in df_new.columns else 0,
-        "skipped":      len(skipped_ids),
-        "skipped_ids":  skipped_ids,
-        "rows":         len(df_final),
-        "atm_count":    int(df_final["ID ATM"].nunique()) if "ID ATM" in df_final.columns else 0,
-        "predictions":  len(predictions),
-        "db_synced":    db_synced,
-        "source":       "Data ATM (Merk, Lokasi, Limit, Denom, Wilayah) diambil dari ATM Master SSI",
+        "message":     "Upload berhasil",
+        "version":     "V8",
+        "format":      "ZIP" if fname.lower().endswith(".zip") else "Excel/CSV",
+        "total_file":  int(df_raw["ID ATM"].nunique()) if "ID ATM" in df_raw.columns else 0,
+        "matched":     int(df_new["ID ATM"].nunique()) if "ID ATM" in df_new.columns else 0,
+        "skipped":     len(skipped_ids),
+        "skipped_ids": skipped_ids,
+        "rows":        len(df_final),
+        "atm_count":   int(df_final["ID ATM"].nunique()) if "ID ATM" in df_final.columns else 0,
+        "predictions": len(predictions),
+        "db_synced":   db_synced,
+        "source":      "Data ATM diambil dari ATM Master SSI",
     }
     if parse_warnings:
         resp["warnings"] = parse_warnings[:15]
+
+    # Activity log upload
+    log_activity(
+        action="UPLOAD",
+        user_id=user.get("id"),
+        username=user.get("username"),
+        role=user.get("role"),
+        entity="data",
+        detail={
+            "filename":  fname,
+            "matched":   resp["matched"],
+            "skipped":   resp["skipped"],
+            "rows":      resp["rows"],
+            "atm_count": resp["atm_count"],
+        },
+        ip_address=_get_ip(request),
+    )
 
     if retrain:
         background_tasks.add_task(_do_retrain, df_final)
@@ -921,12 +946,9 @@ def _sync_notif_from_predictions(predictions: list):
         atm_id = p.get("id_atm", "")
         pct    = float(p.get("pct_saldo", 100) or 100)
 
-        # Skip kalau sudah ada di antrian cashplan
         if atm_id in pending_ids:
             continue
 
-        # SEMUA kondisi → masuk notif dulu, user yang putuskan
-        # Bedanya hanya status_awal yang berbeda (BONGKAR vs AWAS)
         if pct <= TRIGGER_CASHPLAN_PCT * 100:
             try:
                 upsert_notif_cashplan(p)
@@ -939,14 +961,27 @@ def _sync_notif_from_predictions(predictions: list):
 # ════════════════════════════════════════════════════════════════════════════════
 
 @app.post("/api/train", tags=["Training"])
-async def trigger_train(background_tasks: BackgroundTasks):
+async def trigger_train(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    user=Depends(get_current_user),
+):
     if _train_state["status"] == "running":
         raise HTTPException(409, "Training sedang berjalan.")
     if not PROCESSED_CSV.exists():
         raise HTTPException(404, "Belum ada data. Upload terlebih dahulu.")
     df = pd.read_csv(PROCESSED_CSV, low_memory=False)
     background_tasks.add_task(_do_retrain, df)
-    return {"message": "Training V7 dimulai", "monitor": "GET /api/train/status"}
+    log_activity(
+        action="TRAINING",
+        user_id=user.get("id"),
+        username=user.get("username"),
+        role=user.get("role"),
+        entity="model",
+        detail={"trigger": "manual"},
+        ip_address=_get_ip(request),
+    )
+    return {"message": "Training V8 dimulai", "monitor": "GET /api/train/status"}
 
 
 @app.get("/api/train/status", tags=["Training"])
@@ -984,26 +1019,18 @@ def get_predictions(
 
 @app.get("/api/predictions/{atm_id}", tags=["Predictions"])
 def get_prediction_detail(atm_id: str):
-    """
-    FIX v7.1: LEFT JOIN ke atm_masters agar lokasi/wilayah/limit/tipe/denom_options
-    ikut dalam response — dibutuhkan oleh modal Konfirmasi Cash Plan (manual).
-    Pakai LEFT JOIN (bukan INNER) agar ATM yang belum ada di master tetap bisa dibuka.
-    """
     try:
         from database import get_conn, _fmt_pred
 
         _JOIN_DETAIL = """
             SELECT
                 p.*,
-                COALESCE(m.lokasi_atm, '-')   AS lokasi,
-                COALESCE(m.wilayah,    '-')   AS wilayah,
-                COALESCE(m.denom_options, '100000') AS denom_options,
-                COALESCE(m.`limit`, 0)         AS `limit`,
-                m.merk_atm,
-                m.alamat_atm,
-                m.nama_vendor,
-                m.kode_cabang,
-                UPPER(LEFT(p.id_atm, 3))       AS tipe
+                COALESCE(m.lokasi_atm, '-')          AS lokasi,
+                COALESCE(m.wilayah,    '-')           AS wilayah,
+                COALESCE(m.denom_options, '100000')   AS denom_options,
+                COALESCE(m.`limit`, 0)                AS `limit`,
+                m.merk_atm, m.alamat_atm, m.nama_vendor, m.kode_cabang,
+                UPPER(LEFT(p.id_atm, 3))              AS tipe
             FROM predictions p
             LEFT JOIN atm_masters m ON p.id_atm = m.id_atm
             WHERE p.id_atm = %s
@@ -1022,7 +1049,6 @@ def get_prediction_detail(atm_id: str):
     except HTTPException:
         raise
     except Exception:
-        # fallback cache
         cache = load_cache()
         if cache is None:
             raise HTTPException(404, "Belum ada prediksi.")
@@ -1030,6 +1056,7 @@ def get_prediction_detail(atm_id: str):
         if not match:
             raise HTTPException(404, f"ATM {atm_id} tidak ditemukan.")
         return _sanitize(match[0])
+
 
 # ════════════════════════════════════════════════════════════════════════════════
 #  ALERTS & SUMMARY
@@ -1090,8 +1117,6 @@ def get_summary():
             wilayah_rows = cur.fetchall()
             cur.execute("SELECT status, COUNT(*) AS cnt FROM predictions GROUP BY status")
             status_breakdown = {r["status"]: r["cnt"] for r in cur.fetchall()}
-
-            # Tambahan: total master SSI
             cur.execute("SELECT COUNT(*) AS cnt FROM atm_masters WHERE unit_pengisian='SSI'")
             master_ssi_count = cur.fetchone()["cnt"]
 
@@ -1211,16 +1236,11 @@ def get_wilayah():
         from database import get_conn
         with get_conn() as conn:
             cur = conn.cursor(dictionary=True)
-            # JOIN ke atm_masters untuk ambil wilayah
             cur.execute("""
                 SELECT
-                    p.id_atm,
-                    p.pct_saldo,
-                    p.status,
-                    p.skor_urgensi,
-                    p.atm_sepi,
-                    COALESCE(m.lokasi_atm, '-')        AS lokasi,
-                    COALESCE(m.wilayah, 'Unknown')     AS wilayah,
+                    p.id_atm, p.pct_saldo, p.status, p.skor_urgensi, p.atm_sepi,
+                    COALESCE(m.lokasi_atm, '-')         AS lokasi,
+                    COALESCE(m.wilayah, 'Unknown')      AS wilayah,
                     COALESCE(m.denom_options, '100000') AS denom_options,
                     UPPER(LEFT(p.id_atm, 3))            AS tipe
                 FROM predictions p
@@ -1235,10 +1255,7 @@ def get_wilayah():
             w = d.get("wilayah") or "Unknown"
             result.setdefault(w, []).append(d)
 
-        return _sanitize({
-            "wilayah_list": sorted(result.keys()),
-            "data": result
-        })
+        return _sanitize({"wilayah_list": sorted(result.keys()), "data": result})
     except Exception as e:
         raise HTTPException(500, str(e))
 
@@ -1263,6 +1280,7 @@ class CashplanAddRequest(BaseModel):
     skor_urgensi:  float = 0
     denom:         str = "100000"
     added_by:      str = "user"
+    keterangan:    Optional[str] = None
 
 
 class CashplanStatusUpdate(BaseModel):
@@ -1272,13 +1290,32 @@ class CashplanStatusUpdate(BaseModel):
 
 
 @app.post("/api/cashplan", tags=["CashPlan"])
-def api_add_cashplan(req: CashplanAddRequest):
+def api_add_cashplan(request: Request, req: CashplanAddRequest, user=Depends(get_current_user)):
     try:
         data = req.dict()
-        # denom sudah string, add_to_cashplan expects string — langsung pass
         cp_id = add_to_cashplan(data)
+        log_activity(
+            action="CASHPLAN_ADD",
+            user_id=user.get("id"),
+            username=user.get("username"),
+            role=user.get("role"),
+            entity="cashplan",
+            entity_id=cp_id,
+            detail={"id_atm": req.id_atm, "saldo": req.saldo, "pct_saldo": req.pct_saldo, "added_by": req.added_by},
+            ip_address=_get_ip(request),
+        )
         return {"message": "Berhasil ditambahkan", "cashplan_id": cp_id}
     except Exception as e:
+        log_activity(
+            action="CASHPLAN_ADD",
+            user_id=user.get("id"),
+            username=user.get("username"),
+            entity="cashplan",
+            detail={"id_atm": req.id_atm},
+            status="error",
+            error_msg=str(e),
+            ip_address=_get_ip(request),
+        )
         raise HTTPException(500, str(e))
 
 
@@ -1292,13 +1329,29 @@ def api_get_cashplan(status: str = Query("PENDING")):
 
 
 @app.patch("/api/cashplan/{cashplan_id}/status", tags=["CashPlan"])
-def api_update_cashplan_status(cashplan_id: int, body: CashplanStatusUpdate):
+def api_update_cashplan_status(
+    cashplan_id: int,
+    body: CashplanStatusUpdate,
+    request: Request,
+    user=Depends(get_current_user),
+):
     STATUS_MAP = {"DONE": "DONE", "REMOVED": "REMOVED", "SELESAI": "DONE", "BATAL": "REMOVED"}
     mapped = STATUS_MAP.get(body.status.upper())
     if not mapped:
         raise HTTPException(400, f"Status harus salah satu dari: {set(STATUS_MAP.keys())}")
     try:
         result = update_cashplan_status(cashplan_id, mapped, keterangan=body.keterangan, denom=body.denom)
+        action = "CASHPLAN_SELESAI" if mapped == "DONE" else "CASHPLAN_BATAL"
+        log_activity(
+            action=action,
+            user_id=user.get("id"),
+            username=user.get("username"),
+            role=user.get("role"),
+            entity="cashplan",
+            entity_id=cashplan_id,
+            detail={"new_status": body.status, "keterangan": body.keterangan, "denom": body.denom},
+            ip_address=_get_ip(request),
+        )
         return {"message": f"Status diubah ke {body.status.upper()}", **result}
     except ValueError as e:
         raise HTTPException(404, str(e))
@@ -1307,9 +1360,19 @@ def api_update_cashplan_status(cashplan_id: int, body: CashplanStatusUpdate):
 
 
 @app.delete("/api/cashplan/{cashplan_id}", tags=["CashPlan"])
-def api_remove_cashplan(cashplan_id: int):
+def api_remove_cashplan(cashplan_id: int, request: Request, user=Depends(get_current_user)):
     try:
         remove_cashplan_only(cashplan_id)
+        log_activity(
+            action="CASHPLAN_HAPUS",
+            user_id=user.get("id"),
+            username=user.get("username"),
+            role=user.get("role"),
+            entity="cashplan",
+            entity_id=cashplan_id,
+            detail={"reason": "hapus dari antrian"},
+            ip_address=_get_ip(request),
+        )
         return {"message": "Cashplan dihapus dari antrian", "cashplan_id": cashplan_id}
     except ValueError as e:
         raise HTTPException(404, str(e))
@@ -1331,22 +1394,40 @@ def api_get_notif():
 
 
 @app.post("/api/notif-cashplan/{notif_id}/approve", tags=["Notif"])
-def api_approve_notif(notif_id: int):
+def api_approve_notif(notif_id: int, request: Request, user=Depends(get_current_user)):
     try:
         cp_id = approve_notif(notif_id)
+        log_activity(
+            action="NOTIF_APPROVE",
+            user_id=user.get("id"),
+            username=user.get("username"),
+            role=user.get("role"),
+            entity="notif_cashplan",
+            entity_id=notif_id,
+            detail={"cashplan_id": cp_id},
+            ip_address=_get_ip(request),
+        )
         return {"message": "ATM berhasil ditambahkan ke cashplan", "cashplan_id": cp_id}
     except ValueError as e:
         raise HTTPException(404, str(e))
     except Exception as e:
-        import traceback
         traceback.print_exc()
         raise HTTPException(500, f"Approve gagal: {str(e)}")
 
 
 @app.post("/api/notif-cashplan/{notif_id}/dismiss", tags=["Notif"])
-def api_dismiss_notif(notif_id: int):
+def api_dismiss_notif(notif_id: int, request: Request, user=Depends(get_current_user)):
     try:
         dismiss_notif(notif_id)
+        log_activity(
+            action="NOTIF_DISMISS",
+            user_id=user.get("id"),
+            username=user.get("username"),
+            role=user.get("role"),
+            entity="notif_cashplan",
+            entity_id=notif_id,
+            ip_address=_get_ip(request),
+        )
         return {"message": "Notif berhasil di-dismiss"}
     except ValueError as e:
         raise HTTPException(404, str(e))
@@ -1355,11 +1436,19 @@ def api_dismiss_notif(notif_id: int):
 
 
 @app.post("/api/notif-cashplan/dismiss-all", tags=["Notif"])
-def api_dismiss_all_notif():
+def api_dismiss_all_notif(request: Request, user=Depends(get_current_user)):
     try:
         from database import get_conn
         with get_conn() as conn:
             conn.cursor().execute("DELETE FROM notif_cashplan WHERE status_notif='PENDING'")
+        log_activity(
+            action="NOTIF_DISMISS_ALL",
+            user_id=user.get("id"),
+            username=user.get("username"),
+            role=user.get("role"),
+            entity="notif_cashplan",
+            ip_address=_get_ip(request),
+        )
         return {"message": "Semua notif berhasil di-dismiss"}
     except Exception as e:
         raise HTTPException(500, str(e))
@@ -1374,8 +1463,8 @@ class RekapUpdateRequest(BaseModel):
     jam_cash_in:  Optional[str] = None
     jam_cash_out: Optional[str] = None
     denom:        Optional[int] = None
-    
-
+    saldo_awal:   Optional[int] = None
+    jumlah_isi:   Optional[int] = None
 
 
 @app.get("/api/rekap-replacement", tags=["Rekap"])
@@ -1392,11 +1481,31 @@ def api_get_rekap(
 
 
 @app.patch("/api/rekap-replacement/{rekap_id}", tags=["Rekap"])
-def api_update_rekap(rekap_id: int, body: RekapUpdateRequest):
+def api_update_rekap(
+    rekap_id: int,
+    body: RekapUpdateRequest,
+    request: Request,
+    user=Depends(get_current_user),
+):
     try:
         result = update_rekap_replacement(
-            rekap_id, tgl_isi=body.tgl_isi,
-            jam_cash_in=body.jam_cash_in, jam_cash_out=body.jam_cash_out, denom=body.denom,
+            rekap_id,
+            tgl_isi=body.tgl_isi,
+            jam_cash_in=body.jam_cash_in,
+            jam_cash_out=body.jam_cash_out,
+            denom=body.denom,
+            saldo_awal=body.saldo_awal,   # ← tambah ini
+            jumlah_isi=body.jumlah_isi,   # ← tambah ini
+        )
+        log_activity(
+            action="REKAP_UPDATE",
+            user_id=user.get("id"),
+            username=user.get("username"),
+            role=user.get("role"),
+            entity="rekap_replacement",
+            entity_id=rekap_id,
+            detail={k: v for k, v in body.dict().items() if v is not None},
+            ip_address=_get_ip(request),
         )
         return {"message": "Rekap berhasil disimpan", **result}
     except Exception as e:
@@ -1450,6 +1559,10 @@ def api_download_rekap(
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             headers={"Content-Disposition": f'attachment; filename="{filename}.xlsx"'})
 
+
+# ════════════════════════════════════════════════════════════════════════════════
+#  ACTIVITY LOG — endpoint admin
+# ════════════════════════════════════════════════════════════════════════════════
 
 # ════════════════════════════════════════════════════════════════════════════════
 #  ADMIN / DEBUG
@@ -1513,7 +1626,7 @@ def api_get_upload_log(limit: int = Query(50, ge=1, le=200)):
 # ════════════════════════════════════════════════════════════════════════════════
 
 async def _do_retrain(df: pd.DataFrame):
-    _train_state.update({"status": "running", "progress": 0, "message": "Memulai training V7..."})
+    _train_state.update({"status": "running", "progress": 0, "message": "Memulai training V8..."})
 
     def _cb(pct, msg):
         _train_state["progress"] = pct
@@ -1527,7 +1640,7 @@ async def _do_retrain(df: pd.DataFrame):
         loop   = asyncio.get_event_loop()
         result = await loop.run_in_executor(None, lambda: train(df, _cb))
 
-        _cb(95, "Rebuild prediksi cache V7...")
+        _cb(95, "Rebuild prediksi cache V8...")
         predictions = build_predictions(df)
         save_cache(predictions)
 
@@ -1540,7 +1653,7 @@ async def _do_retrain(df: pd.DataFrame):
         _train_state.update({
             "status":       "done",
             "progress":     100,
-            "message":      f"Training V7 selesai ✅ MAE={result.get('mae_avg')} jam | R²={result.get('r2_avg')}",
+            "message":      f"Training V8 selesai ✅ MAE={result.get('mae_avg')} jam | R²={result.get('r2_avg')}",
             "last_trained": datetime.now().isoformat(),
             "last_result":  result,
         })

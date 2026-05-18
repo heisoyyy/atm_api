@@ -42,3 +42,25 @@ ALTER TABLE users ADD COLUMN is_approved TINYINT(1) NOT NULL DEFAULT 0 AFTER is_
 
 -- User admin yang sudah ada, set approved langsung
 -- UPDATE users SET is_approved = 1 WHERE role = 'admin';
+
+
+-- ============================================================
+-- 9. activity_log
+-- ============================================================
+CREATE TABLE IF NOT EXISTS activity_log (
+    id          BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    user_id     INT             DEFAULT NULL,
+    username    VARCHAR(100)    DEFAULT NULL,
+    role        VARCHAR(50)     DEFAULT NULL,
+    action      VARCHAR(100)    NOT NULL,          -- 'UPLOAD', 'CASHPLAN_ADD', dll
+    entity      VARCHAR(100)    DEFAULT NULL,      -- 'cashplan', 'rekap', 'user', dll
+    entity_id   VARCHAR(100)    DEFAULT NULL,      -- id record yang diubah
+    detail      JSON            DEFAULT NULL,      -- payload ringkas
+    ip_address  VARCHAR(64)     DEFAULT NULL,
+    status      ENUM('ok','error') DEFAULT 'ok',
+    error_msg   TEXT            DEFAULT NULL,
+    created_at  DATETIME        DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_user    (user_id),
+    INDEX idx_action  (action),
+    INDEX idx_created (created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

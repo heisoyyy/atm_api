@@ -840,20 +840,27 @@ def update_rekap_replacement(
     jam_cash_in: str = None,
     jam_cash_out:str = None,
     denom:       int = None,
+    saldo_awal:  int = None,   # ← tambah ini
+    jumlah_isi:  int = None,   # ← tambah ini
 ) -> dict:
     updates = {"is_saved": 1}
+
+    if saldo_awal   is not None: updates["saldo_awal"]   = saldo_awal
+    if jumlah_isi   is not None: updates["jumlah_isi"]   = jumlah_isi
     if tgl_isi      is not None: updates["tgl_isi"]      = tgl_isi
     if jam_cash_in  is not None: updates["jam_cash_in"]  = jam_cash_in
     if jam_cash_out is not None: updates["jam_cash_out"] = jam_cash_out
     if denom        is not None:
         updates["denom"] = denom
-        with get_conn() as conn:
-            cur = conn.cursor(dictionary=True)
-            cur.execute("SELECT jumlah_isi FROM rekap_replacement WHERE id=%s", (rekap_id,))
-            row = cur.fetchone()
-        if row:
-            jumlah_isi = int(row["jumlah_isi"] or 0)
-            updates["lembar"] = math.ceil(jumlah_isi / denom) if denom > 0 else 0
+        # hitung lembar dari jumlah_isi yang baru atau dari DB jika tidak dikirim
+        ji = jumlah_isi
+        if ji is None:
+            with get_conn() as conn:
+                cur = conn.cursor(dictionary=True)
+                cur.execute("SELECT jumlah_isi FROM rekap_replacement WHERE id=%s", (rekap_id,))
+                row = cur.fetchone()
+            ji = int(row["jumlah_isi"] or 0) if row else 0
+        updates["lembar"] = math.ceil(ji / denom) if denom > 0 else 0
 
     set_parts = ", ".join(f"{k}=%s" for k in updates)
     vals      = list(updates.values()) + [rekap_id]
@@ -965,3 +972,86 @@ def log_upload(
             (filename, format_, rows, atm_count, matched, skipped,
              predictions, int(retrain), notes)
         )
+        
+# ══════════════════════════════════════════════════════════════
+#  ACTIVITY LOG
+# ══════════════════════════════════════════════════════════════
+
+import json as _json
+
+def log_activity(
+    action:     str,
+    user_id:    int   = None,
+    username:   str   = None,
+    role:       str   = None,
+    entity:     str   = None,
+    entity_id:  str   = None,
+    detail:     dict  = None,
+    ip_address: str   = None,
+    status:     str   = "ok",
+    error_msg:  str   = None,
+):
+    try:
+        sql = """
+            INSERT INTO activity_log
+                (user_id, username, role, action, entity, entity_id,
+                 detail, ip_address, status, error_msg)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """
+        detail_json = _json.dumps(detail, ensure_ascii=False) if detail else None
+        with get_conn() as conn:
+            conn.cursor().execute(sql, (
+                user_id, username, role, action, entity,
+                str(entity_id) if entity_id is not None else None,
+                detail_json, ip_address, status, error_msg,
+            ))
+    except Exception:
+        pass  # log failure tidak boleh break endpoint utama
+
+
+def get_activity_log(
+    user_id:   int = None,
+    action:    str = None,
+    entity:    str = None,
+    date_from: str = None,
+    date_to:   str = None,
+    limit:     int = 100,
+    offset:    int = 0,
+) -> dict:
+    where, params = [], []
+    if user_id:
+        where.append("user_id = %s"); params.append(user_id)
+    if action:
+        where.append("action = %s"); params.append(action.upper())
+    if entity:
+        where.append("entity = %s"); params.append(entity.lower())
+    if date_from:
+        where.append("DATE(created_at) >= %s"); params.append(date_from)
+    if date_to:
+        where.append("DATE(created_at) <= %s"); params.append(date_to)
+
+    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+
+    with get_conn() as conn:
+        cur = conn.cursor(dictionary=True)
+        cur.execute(
+            f"SELECT COUNT(*) AS cnt FROM activity_log {where_sql}", params
+        )
+        total = cur.fetchone()["cnt"]
+        cur.execute(
+            f"SELECT * FROM activity_log {where_sql} "
+            f"ORDER BY created_at DESC LIMIT %s OFFSET %s",
+            params + [limit, offset]
+        )
+        rows = cur.fetchall()
+
+    for r in rows:
+        if r.get("created_at"):
+            r["created_at"] = r["created_at"].isoformat()
+        if r.get("detail") and isinstance(r["detail"], str):
+            try:
+                r["detail"] = _json.loads(r["detail"])
+            except Exception:
+                pass
+
+    return {"total": total, "data": rows}
