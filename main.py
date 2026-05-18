@@ -1559,6 +1559,19 @@ def api_download_rekap(
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             headers={"Content-Disposition": f'attachment; filename="{filename}.xlsx"'})
 
+@app.post("/api/rekap-replacement/{rekap_id}/unlock", tags=["Rekap"])
+def api_unlock_rekap(rekap_id: int, request: Request, admin=Depends(require_admin)):
+    with get_conn() as conn:
+        conn.cursor().execute(
+            "UPDATE rekap_replacement SET is_saved=0 WHERE id=%s", (rekap_id,)
+        )
+    log_activity(
+        action="REKAP_UNLOCK",
+        user_id=admin.get("id"), username=admin.get("username"), role=admin.get("role"),
+        entity="rekap_replacement", entity_id=rekap_id,
+        ip_address=_get_ip(request),
+    )
+    return {"message": "Rekap dibuka untuk edit", "rekap_id": rekap_id}
 
 # ════════════════════════════════════════════════════════════════════════════════
 #  ACTIVITY LOG — endpoint admin
